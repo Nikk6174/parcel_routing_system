@@ -1,0 +1,71 @@
+# ──────────────────────────────────────────────────────────
+# CI Pipeline — Parcel Routing System
+#
+# Runs on every PR and push to main:
+#   lint → typecheck → unit tests → integration tests → build
+#
+# Fails the PR if any step fails. Branch protection rules should
+# be configured in GitHub to require this workflow to pass before
+# merging (see README → "Branch protection recommendation").
+# ──────────────────────────────────────────────────────────
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    name: Lint → Typecheck → Test → Build
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20]
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Node.js setup ─────────────────────────────────────
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      # ── Install dependencies ──────────────────────────────
+      - name: Install dependencies
+        run: npm ci
+
+      # ── Build shared package first (other packages depend on it) ──
+      - name: Build shared package
+        run: npm run -w packages/shared build
+
+      # ── Lint ──────────────────────────────────────────────
+      - name: Lint
+        run: npm run lint
+
+      # ── Typecheck ─────────────────────────────────────────
+      - name: Typecheck (API)
+        run: npm run -w apps/api build
+
+      - name: Typecheck (Web)
+        run: npm run -w apps/web build
+
+      # ── Tests ─────────────────────────────────────────────
+      # All tests (unit + integration + e2e) run under one command.
+      # Tests use mongodb-memory-server (downloads mongod binary
+      # automatically on first run, cached by npm ci).
+      - name: Run tests
+        run: npm test
+        env:
+          # Ensure tests don't accidentally try to connect to real services
+          NODE_ENV: test
+
+      # ── Build (production bundle) ─────────────────────────
+      - name: Build all packages
+        run: npm run build
