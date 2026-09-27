@@ -76,10 +76,10 @@ export interface PipelineConfig {
 }
 
 export const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
-  batchSize: 50,
-  bufferMaxSize: 50,
-  bufferFlushIntervalMs: 5_000,
-  claimIntervalMs: 1_000,
+  batchSize: 1000,
+  bufferMaxSize: 200,
+  bufferFlushIntervalMs: 1_000,
+  claimIntervalMs: 200,
   staleSweepIntervalMs: 30_000,
   staleAfterMs: 300_000,
   maxRetries: 3,

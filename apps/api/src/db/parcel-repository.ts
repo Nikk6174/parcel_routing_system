@@ -238,4 +238,62 @@ export class ParcelRepository {
     );
     return result.modifiedCount > 0;
   }
+
+  /**
+   * Fetch up to `limit` parcels with status RECEIVED in a single query.
+   * Used by the in-memory claiming strategy — no status update in DB,
+   * just a bulk read. The orchestrator tracks claims in memory.
+   */
+  async fetchReceived(limit: number): Promise<ParcelDocument[]> {
+    return this.collection
+      .find({ status: PARCEL_STATUS.RECEIVED })
+      .sort({ createdAt: 1 })
+      .limit(limit)
+      .toArray();
+  }
+
+  /**
+   * Bulk-update parcel statuses in a single bulkWrite call.
+   * Replaces N individual updateOne calls with one batched operation.
+   */
+  async bulkUpdateStatus(
+    updates: Array<{ parcelId: string; status: ParcelStatus }>,
+  ): Promise<number> {
+    if (updates.length === 0) return 0;
+
+    const ops = updates.map((u) => ({
+      updateOne: {
+        filter: { _id: u.parcelId },
+        update: { $set: { status: u.status } },
+      },
+    }));
+
+    const result = await this.collection.bulkWrite(ops, { ordered: false });
+    return result.modifiedCount;
+  }
+
+  /**
+   * Bulk re-queue parcels back to RECEIVED (for stale recovery or retries).
+   * Single bulkWrite call instead of N individual updateOne calls.
+   */
+  async bulkRequeue(parcelIds: string[]): Promise<number> {
+    if (parcelIds.length === 0) return 0;
+
+    const ops = parcelIds.map((id) => ({
+      updateOne: {
+        filter: { _id: id },
+        update: {
+          $set: {
+            status: PARCEL_STATUS.RECEIVED as ParcelStatus,
+            claimedBy: null,
+            claimedAt: null,
+          },
+          $inc: { retryCount: 1 },
+        },
+      },
+    }));
+
+    const result = await this.collection.bulkWrite(ops, { ordered: false });
+    return result.modifiedCount;
+  }
 }

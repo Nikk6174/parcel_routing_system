@@ -6,7 +6,7 @@ import type { ResultsFilter } from '../App';
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
 const TERMINAL_STATUSES = new Set([
-  'ROUTED', 'APPROVED', 'REJECTED', 'FAILED', 'TIMED_OUT', 'UNROUTED',
+  'ROUTED', 'APPROVED', 'REJECTED', 'FAILED', 'TIMED_OUT', 'UNROUTED', 'PENDING_APPROVAL',
 ]);
 
 interface BatchUploadProps {
