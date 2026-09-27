@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+*.tsbuildinfo
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
