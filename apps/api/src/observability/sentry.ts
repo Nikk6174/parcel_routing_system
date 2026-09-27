@@ -130,11 +130,17 @@ export function cronCheckIn(
   checkInId?: string,
 ): string | undefined {
   if (!sentryEnabled) return undefined;
-  return Sentry.captureCheckIn(
-    { monitorSlug: slug, status },
-    undefined,
-    checkInId,
-  );
+  if (status === 'in_progress') {
+    return Sentry.captureCheckIn({
+      monitorSlug: slug,
+      status: 'in_progress',
+    });
+  }
+  return Sentry.captureCheckIn({
+    monitorSlug: slug,
+    status,
+    checkInId: checkInId ?? '',
+  });
 }
 
 /** Re-export Sentry for direct access where needed. */

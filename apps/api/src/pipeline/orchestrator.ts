@@ -19,8 +19,6 @@ import type {
 } from './types.js';
 import {
   countParcelProcessed,
-  recordProcessingDuration,
-  emitTickGauges,
   captureParcelError,
   cronCheckIn,
 } from '../observability/index.js';

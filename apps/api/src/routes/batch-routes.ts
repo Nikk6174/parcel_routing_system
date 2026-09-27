@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import {
   PARCEL_STATUS,
-  parcelInputSchema,
   type ParcelDocument,
 } from '@parcel-routing/shared';
 import type { ParcelRepository } from '../db/parcel-repository.js';

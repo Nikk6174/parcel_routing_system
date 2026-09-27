@@ -20,8 +20,8 @@ export function countParcelProcessed(
   department: string | null,
 ): void {
   if (!isSentryEnabled()) return;
-  Sentry.metrics.increment('parcels_processed', 1, {
-    tags: { status, department: department ?? 'UNROUTED' },
+  Sentry.metrics.count('parcels_processed', 1, {
+    attributes: { status, department: department ?? 'UNROUTED' },
   });
 }
 

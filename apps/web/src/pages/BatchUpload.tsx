@@ -2,13 +2,18 @@ import React, { useState, useCallback } from 'react';
 import { uploadBatch, getBatchStatus, type BatchUploadResponse, type BatchStatusResponse } from '../api/client';
 import { ConnectionIndicator } from '../components/ConnectionIndicator';
 import { usePolling } from '../hooks/usePolling';
+import type { ResultsFilter } from '../App';
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
 const TERMINAL_STATUSES = new Set([
   'ROUTED', 'APPROVED', 'REJECTED', 'FAILED', 'TIMED_OUT', 'UNROUTED',
 ]);
 
-export function BatchUpload(): React.ReactElement {
+interface BatchUploadProps {
+  onNavigateToResults?: (filter: ResultsFilter) => void;
+}
+
+export function BatchUpload({ onNavigateToResults }: BatchUploadProps): React.ReactElement {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadResult, setUploadResult] = useState<BatchUploadResponse | null>(null);
@@ -93,8 +98,13 @@ export function BatchUpload(): React.ReactElement {
           </div>
         </div>
 
-        {/* Live-updating aggregate counts */}
-        {batchStatus && <BatchCountsDisplay counts={batchStatus.counts} />}
+        {/* Live-updating aggregate counts — click a box to see those parcels */}
+        {batchStatus && (
+          <BatchCountsDisplay
+            counts={batchStatus.counts}
+            onStatusClick={(status) => onNavigateToResults?.({ status, batchId: uploadResult.batchId })}
+          />
+        )}
 
         <ConnectionIndicator isStale={isStale} isPolling={isPolling} lastUpdated={lastUpdated} />
 
@@ -133,9 +143,10 @@ export function BatchUpload(): React.ReactElement {
 
 interface BatchCountsDisplayProps {
   counts: Record<string, number>;
+  onStatusClick?: (status: string) => void;
 }
 
-function BatchCountsDisplay({ counts }: BatchCountsDisplayProps): React.ReactElement {
+function BatchCountsDisplay({ counts, onStatusClick }: BatchCountsDisplayProps): React.ReactElement {
   const routed = (counts['ROUTED'] ?? 0) + (counts['APPROVED'] ?? 0);
   const held = counts['PENDING_APPROVAL'] ?? 0;
   const failed = (counts['FAILED'] ?? 0) + (counts['REJECTED'] ?? 0);
@@ -143,22 +154,42 @@ function BatchCountsDisplay({ counts }: BatchCountsDisplayProps): React.ReactEle
 
   return (
     <div className="batch-counts" data-testid="batch-counts">
-      <div className="batch-counts__item batch-counts__item--success">
+      <button
+        type="button"
+        className="batch-counts__item batch-counts__item--success batch-counts__item--clickable"
+        onClick={() => onStatusClick?.('ROUTED')}
+        title="View routed parcels"
+      >
         <span className="batch-counts__number">{routed}</span>
         <span className="batch-counts__label">Routed</span>
-      </div>
-      <div className="batch-counts__item batch-counts__item--warning">
+      </button>
+      <button
+        type="button"
+        className="batch-counts__item batch-counts__item--warning batch-counts__item--clickable"
+        onClick={() => onStatusClick?.('PENDING_APPROVAL')}
+        title="View parcels held for approval"
+      >
         <span className="batch-counts__number">{held}</span>
         <span className="batch-counts__label">Held</span>
-      </div>
-      <div className="batch-counts__item batch-counts__item--danger">
+      </button>
+      <button
+        type="button"
+        className="batch-counts__item batch-counts__item--danger batch-counts__item--clickable"
+        onClick={() => onStatusClick?.('FAILED')}
+        title="View failed parcels"
+      >
         <span className="batch-counts__number">{failed}</span>
         <span className="batch-counts__label">Failed</span>
-      </div>
-      <div className="batch-counts__item batch-counts__item--info">
+      </button>
+      <button
+        type="button"
+        className="batch-counts__item batch-counts__item--info batch-counts__item--clickable"
+        onClick={() => onStatusClick?.('RECEIVED')}
+        title="View pending parcels"
+      >
         <span className="batch-counts__number">{pending}</span>
         <span className="batch-counts__label">Pending</span>
-      </div>
+      </button>
     </div>
   );
 }

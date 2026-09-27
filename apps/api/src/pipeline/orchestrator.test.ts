@@ -1,11 +1,9 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import { MongoClient, type Db } from 'mongodb';
 import {
   PARCEL_STATUS,
   type ParcelDocument,
-  type Rule,
-  type RuleEngineResult,
 } from '@parcel-routing/shared';
 import { ParcelRepository } from '../db/parcel-repository.js';
 import { OutcomeRepository } from '../db/outcome-repository.js';

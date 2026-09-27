@@ -4,7 +4,7 @@ import { MongoClient, type Db } from 'mongodb';
 import type { FastifyInstance } from 'fastify';
 import { SignJWT } from 'jose';
 import { PARCEL_STATUS } from '@parcel-routing/shared';
-import { createTestApp, TEST_JWT_SECRET } from '../app.js';
+import { createTestApp } from '../app.js';
 import { getSecretKey } from '../security/index.js';
 import { ParcelRepository } from '../db/parcel-repository.js';
 

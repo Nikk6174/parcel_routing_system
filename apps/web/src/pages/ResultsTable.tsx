@@ -4,23 +4,36 @@ import {
   getParcel,
   approveParcel,
   rejectParcel,
-  type ParcelData,
   type PaginatedParcelsResponse,
   type ParcelDetailResponse,
 } from '../api/client';
 import { StatusBadge } from '../components/StatusBadge';
 import { sanitize } from '../utils/sanitize';
+import type { ResultsFilter } from '../App';
 
 const PAGE_SIZE = 20;
 
-export function ResultsTable(): React.ReactElement {
+interface ResultsTableProps {
+  initialFilter?: ResultsFilter;
+  onClearFilter?: () => void;
+}
+
+export function ResultsTable({ initialFilter, onClearFilter }: ResultsTableProps): React.ReactElement {
   const [data, setData] = useState<PaginatedParcelsResponse | null>(null);
   const [page, setPage] = useState(1);
-  const [statusFilter, setStatusFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState(initialFilter?.status ?? '');
+  const [batchIdFilter, setBatchIdFilter] = useState(initialFilter?.batchId ?? '');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedParcel, setSelectedParcel] = useState<ParcelDetailResponse | null>(null);
   const [actionInFlight, setActionInFlight] = useState(false);
+
+  // Sync external filter changes (e.g. clicking a batch count box)
+  useEffect(() => {
+    setStatusFilter(initialFilter?.status ?? '');
+    setBatchIdFilter(initialFilter?.batchId ?? '');
+    setPage(1);
+  }, [initialFilter?.status, initialFilter?.batchId]);
 
   const loadParcels = useCallback(async (): Promise<void> => {
     setLoading(true);
@@ -30,6 +43,7 @@ export function ResultsTable(): React.ReactElement {
         page,
         limit: PAGE_SIZE,
         status: statusFilter || undefined,
+        batchId: batchIdFilter || undefined,
       });
       setData(result);
     } catch (err: unknown) {
@@ -37,7 +51,7 @@ export function ResultsTable(): React.ReactElement {
     } finally {
       setLoading(false);
     }
-  }, [page, statusFilter]);
+  }, [page, statusFilter, batchIdFilter]);
 
   useEffect(() => {
     void loadParcels();
@@ -182,6 +196,22 @@ export function ResultsTable(): React.ReactElement {
           </button>
         </div>
       </div>
+
+      {/* Active batch filter banner */}
+      {batchIdFilter && (
+        <div className="filter-banner">
+          <span>
+            Filtered by batch <span className="mono">{batchIdFilter.slice(0, 12)}…</span>
+            {statusFilter && <> · status <strong>{statusFilter}</strong></>}
+          </span>
+          <button className="btn btn--sm btn--ghost" onClick={() => {
+            setBatchIdFilter('');
+            setStatusFilter('');
+            setPage(1);
+            onClearFilter?.();
+          }}>✕ Clear filter</button>
+        </div>
+      )}
 
       {error && <div className="alert alert--danger">{error}</div>}
 
