@@ -51,8 +51,10 @@ export function BatchUpload({ onNavigateToResults }: BatchUploadProps): React.Re
      * content) is enforced server-side by @fastify/multipart and the
      * streaming parsers. A malicious user can bypass these checks trivially.
      */
-    if (!file.name.endsWith('.json')) {
-      setError('Only .json files are supported. Use the correct file format.');
+    const isJson = file.name.endsWith('.json');
+    const isXml = file.name.endsWith('.xml');
+    if (!isJson && !isXml) {
+      setError('Only .json and .xml files are supported. Use the correct file format.');
       return;
     }
     if (file.size > MAX_FILE_SIZE) {
@@ -121,16 +123,16 @@ export function BatchUpload({ onNavigateToResults }: BatchUploadProps): React.Re
     <div className="card">
       <h2>Batch Upload</h2>
       <p className="text-muted">
-        Upload a JSON file containing an array of parcel objects.
+        Upload a JSON or XML container file containing parcel records.
         Each parcel is validated individually — invalid rows are rejected
         without failing the entire batch.
       </p>
 
       <label className="file-picker">
-        <input type="file" accept=".json" onChange={(e) => void handleFileChange(e)}
+        <input type="file" accept=".json,.xml" onChange={(e) => void handleFileChange(e)}
           disabled={uploading} className="file-picker__input" />
         <span className="file-picker__label">
-          {uploading ? 'Uploading…' : 'Choose a .json file'}
+          {uploading ? 'Uploading…' : 'Choose a .json or .xml file'}
         </span>
       </label>
 

@@ -131,10 +131,21 @@ export function cronCheckIn(
 ): string | undefined {
   if (!sentryEnabled) return undefined;
   if (status === 'in_progress') {
-    return Sentry.captureCheckIn({
-      monitorSlug: slug,
-      status: 'in_progress',
-    });
+    return Sentry.captureCheckIn(
+      {
+        monitorSlug: slug,
+        status: 'in_progress',
+      },
+      {
+        schedule: {
+          type: 'interval',
+          value: 1,
+          unit: 'minute',
+        },
+        checkinMargin: 2,
+        maxRuntime: 1,
+      },
+    );
   }
   return Sentry.captureCheckIn({
     monitorSlug: slug,

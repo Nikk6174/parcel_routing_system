@@ -81,6 +81,7 @@ export class PipelineOrchestrator {
   private readonly buffer: ResultBuffer;
   private cronSlug: string;
   private lastCheckInId: string | undefined;
+  private lastCronCheckInTime = 0;
 
   /**
    * In-memory claim tracker. Maps parcelId → InFlightEntry.
@@ -259,23 +260,32 @@ export class PipelineOrchestrator {
 
   private async runClaimLoop(): Promise<void> {
     while (this.running) {
-      // Cron check-in: mark "in progress" at start of tick
-      this.lastCheckInId = cronCheckIn(this.cronSlug, 'in_progress') ?? this.lastCheckInId;
+      const now = Date.now();
+      const shouldCronCheckIn = now - this.lastCronCheckInTime >= 60_000;
+
+      if (shouldCronCheckIn) {
+        this.lastCronCheckInTime = now;
+        this.lastCheckInId = cronCheckIn(this.cronSlug, 'in_progress') ?? this.lastCheckInId;
+      }
 
       try {
         await this.processCycle();
 
-        // Record heartbeat for /ready staleness check
+        // Record heartbeat for /ready staleness check (every tick)
         recordOrchestratorTick();
 
-        // Cron check-in: mark "ok" after successful tick
-        cronCheckIn(this.cronSlug, 'ok', this.lastCheckInId);
+        // Cron check-in: mark "ok" after successful tick if this tick was checked in
+        if (shouldCronCheckIn && this.lastCheckInId) {
+          cronCheckIn(this.cronSlug, 'ok', this.lastCheckInId);
+        }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         this.logger.error('Claim cycle failed', { error: message });
 
         // Cron check-in: mark "error" on tick failure
-        cronCheckIn(this.cronSlug, 'error', this.lastCheckInId);
+        if (this.lastCheckInId) {
+          cronCheckIn(this.cronSlug, 'error', this.lastCheckInId);
+        }
       }
       await this.sleep(this.config.claimIntervalMs);
     }
@@ -368,7 +378,7 @@ export class PipelineOrchestrator {
       parcel: ParcelDocument;
     }> = [];
     const toRetry: Array<{ parcel: ParcelDocument; reason: string }> = [];
-    const toFail: Array<{ parcel: ParcelDocument; reason: string }> = [];
+    const toFail: Array<{ parcel: ParcelDocument; reason: string; retryCount?: number }> = [];
 
     for (const item of items) {
       if (item.output.error !== null) {
@@ -454,7 +464,7 @@ export class PipelineOrchestrator {
         });
       } else {
         // Exceeded max retries — move to permanent failure
-        toFail.push(retry);
+        toFail.push({ ...retry, retryCount: newRetryCount });
       }
       // Remove from in-flight either way
       this.inFlight.delete(retry.parcel._id);
@@ -480,6 +490,7 @@ export class PipelineOrchestrator {
         toFail.map((f) => ({
           parcelId: f.parcel._id,
           status: PARCEL_STATUS.FAILED as ParcelStatus,
+          retryCount: f.retryCount,
         })),
       );
 
@@ -487,6 +498,12 @@ export class PipelineOrchestrator {
       for (const fail of toFail) {
         countParcelProcessed('FAILED', null);
         this.inFlight.delete(fail.parcel._id);
+
+        this.logger.error('Parcel permanently failed after max retries', {
+          parcelId: fail.parcel._id,
+          correlationId: fail.parcel.correlationId,
+          reason: fail.reason,
+        });
 
         captureParcelError(
           new Error(`Parcel permanently failed: ${fail.reason}`),

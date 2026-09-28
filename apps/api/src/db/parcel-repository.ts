@@ -257,16 +257,22 @@ export class ParcelRepository {
    * Replaces N individual updateOne calls with one batched operation.
    */
   async bulkUpdateStatus(
-    updates: Array<{ parcelId: string; status: ParcelStatus }>,
+    updates: Array<{ parcelId: string; status: ParcelStatus; retryCount?: number }>,
   ): Promise<number> {
     if (updates.length === 0) return 0;
 
-    const ops = updates.map((u) => ({
-      updateOne: {
-        filter: { _id: u.parcelId },
-        update: { $set: { status: u.status } },
-      },
-    }));
+    const ops = updates.map((u) => {
+      const setObj: Record<string, unknown> = { status: u.status };
+      if (u.retryCount !== undefined) {
+        setObj['retryCount'] = u.retryCount;
+      }
+      return {
+        updateOne: {
+          filter: { _id: u.parcelId },
+          update: { $set: setObj },
+        },
+      };
+    });
 
     const result = await this.collection.bulkWrite(ops, { ordered: false });
     return result.modifiedCount;
