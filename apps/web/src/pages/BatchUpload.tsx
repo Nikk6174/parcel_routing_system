@@ -17,6 +17,9 @@ export function BatchUpload({ onNavigateToResults }: BatchUploadProps): React.Re
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadResult, setUploadResult] = useState<BatchUploadResponse | null>(null);
+  const [manualStatus, setManualStatus] = useState<BatchStatusResponse | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshTime, setRefreshTime] = useState<Date | null>(null);
 
   const fetcher = useCallback(
     () => (uploadResult ? getBatchStatus(uploadResult.batchId) : Promise.reject(new Error('no id'))),
@@ -37,6 +40,23 @@ export function BatchUpload({ onNavigateToResults }: BatchUploadProps): React.Re
       },
     },
   );
+
+  const handleRefresh = async (): Promise<void> => {
+    if (!uploadResult) return;
+    setRefreshing(true);
+    try {
+      const latest = await getBatchStatus(uploadResult.batchId);
+      setManualStatus(latest);
+      setRefreshTime(new Date());
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Refresh failed');
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const currentBatchStatus = manualStatus ?? batchStatus;
+  const displayLastUpdated = refreshTime ?? lastUpdated;
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
     const file = e.target.files?.[0];
@@ -101,19 +121,32 @@ export function BatchUpload({ onNavigateToResults }: BatchUploadProps): React.Re
         </div>
 
         {/* Live-updating aggregate counts — click a box to see those parcels */}
-        {batchStatus && (
+        {currentBatchStatus && (
           <BatchCountsDisplay
-            counts={batchStatus.counts}
+            counts={currentBatchStatus.counts}
             onStatusClick={(status) => onNavigateToResults?.({ status, batchId: uploadResult.batchId })}
           />
         )}
 
-        <ConnectionIndicator isStale={isStale} isPolling={isPolling} lastUpdated={lastUpdated} />
+        <ConnectionIndicator isStale={isStale} isPolling={isPolling} lastUpdated={displayLastUpdated} />
 
-        <button className="btn btn--secondary" style={{ marginTop: '1rem' }}
-          onClick={() => { setUploadResult(null); setError(null); }}>
-          Upload Another
-        </button>
+        <div style={{ display: 'flex', gap: '0.75rem', marginTop: '1rem', alignItems: 'center' }}>
+          <button className="btn btn--secondary"
+            onClick={() => { setUploadResult(null); setError(null); setManualStatus(null); setRefreshTime(null); }}>
+            Upload Another
+          </button>
+          <button
+            type="button"
+            className="btn btn--secondary"
+            onClick={() => void handleRefresh()}
+            disabled={refreshing}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem' }}
+            title="Refresh batch status"
+          >
+            <span style={{ display: 'inline-block', transform: refreshing ? 'rotate(180deg)' : 'none', transition: 'transform 0.3s' }}>↻</span>
+            {refreshing ? 'Refreshing…' : 'Refresh Status'}
+          </button>
+        </div>
       </div>
     );
   }
