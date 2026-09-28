@@ -1,6 +1,6 @@
 import type { FastifyRequest, FastifyReply } from 'fastify';
-import { createSecretKey } from 'node:crypto';
-import { jwtVerify, type KeyLike } from 'jose';
+import { createSecretKey, type KeyObject } from 'node:crypto';
+import { jwtVerify } from 'jose';
 
 /**
  * Valid application roles.
@@ -25,7 +25,7 @@ interface JwtClaims {
  * rather than a symmetric secret. This keeps the app decoupled from
  * the identity provider and allows key rotation without app redeployment.
  */
-let secretKey: KeyLike | undefined;
+let secretKey: KeyObject | Uint8Array | undefined;
 
 /**
  * Initialize the JWT verification key.
@@ -47,7 +47,7 @@ export function initJwtSecret(secret: string): void {
  * Get the configured secret key.
  * Exported for test utilities that need to sign test tokens.
  */
-export function getSecretKey(): KeyLike {
+export function getSecretKey(): KeyObject | Uint8Array {
   if (!secretKey) {
     throw new Error('JWT secret not initialized — call initJwtSecret() first');
   }
@@ -111,8 +111,7 @@ export function authorize(requiredRole: AppRole) {
       }
 
       // Attach decoded claims to the request for downstream handlers.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (request as Record<string, unknown>)['user'] = {
+      (request as unknown as Record<string, unknown>)['user'] = {
         sub: claims.sub,
         role: claims.role,
       };

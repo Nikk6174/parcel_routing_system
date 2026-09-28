@@ -28,6 +28,12 @@ export async function ruleRoutes(
 ): Promise<void> {
   const { ruleRepo, onRuleChange } = opts;
 
+  // ── GET /rules ────────────────────────────────────────
+  app.get('/rules', async (_request, reply) => {
+    const rules = await ruleRepo.findActive();
+    await reply.send({ status: 'ok', data: { rules } });
+  });
+
   // ── POST /rules ───────────────────────────────────────
   app.post(
     '/rules',

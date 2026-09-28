@@ -5,7 +5,7 @@
  * error handling logic live in exactly one place.
  */
 
-const API_BASE = '/api';
+const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
 interface ApiResponse<T> {
   status: 'ok' | 'error';
@@ -25,16 +25,40 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Development JWT tokens (1-year expiry, signed with the dev JWT_SECRET).
+ * In production these would come from a login flow / identity provider.
+ */
+const DEV_TOKENS: Record<string, string> = {
+  operator: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZXYtb3BlcmF0b3IiLCJyb2xlIjoib3BlcmF0b3IiLCJleHAiOjE4MjIwNTA3NzR9.FSPuFcvQx895gBgZ4-DZkNzw4-tgypS5ZtX5VIBk0E0',
+  admin: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZXYtYWRtaW4iLCJyb2xlIjoiYWRtaW4iLCJleHAiOjE4MjIwNTA3ODl9.QvHGPDvS1anlkZLohsSqJ9g2cj7jd3My3BS2fMlGQ5U',
+  insurance_approver: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZXYtYXBwcm92ZXIiLCJyb2xlIjoiaW5zdXJhbmNlX2FwcHJvdmVyIiwiZXhwIjoxODIyMDUwNzg5fQ.d8q72AGrW867FsHYmPLkF8hoC_vicAAmgwhnYXZ34HA',
+};
+
+/** Currently active role for the dev session. */
+let activeRole = 'operator';
+
+/** Switch the active role (for UI role switching). */
+export function setActiveRole(role: string): void {
+  activeRole = role;
+}
+
+export function getActiveRole(): string {
+  return activeRole;
+}
+
 async function request<T>(
   path: string,
   options: RequestInit = {},
 ): Promise<T> {
   const url = `${API_BASE}${path}`;
+  const token = DEV_TOKENS[activeRole] ?? DEV_TOKENS['operator'];
 
   const res = await fetch(url, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,
       ...options.headers,
     },
   });
@@ -161,7 +185,12 @@ export async function uploadBatch(file: File): Promise<BatchUploadResponse> {
   form.append('file', file);
 
   const url = `${API_BASE}/parcels/batch`;
-  const res = await fetch(url, { method: 'POST', body: form });
+  const token = DEV_TOKENS[activeRole] ?? DEV_TOKENS['operator'];
+  const res = await fetch(url, {
+    method: 'POST',
+    body: form,
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
   const body = (await res.json()) as ApiResponse<BatchUploadResponse>;
 
   if (!res.ok || body.status === 'error') {
@@ -177,13 +206,64 @@ export async function getBatchStatus(batchId: string): Promise<BatchStatusRespon
 export async function approveParcel(parcelId: string): Promise<void> {
   await request(`/parcels/${parcelId}/approve`, {
     method: 'POST',
-    headers: { 'X-Role': 'insurance-approver' },
+    body: '{}',
   });
 }
 
 export async function rejectParcel(parcelId: string): Promise<void> {
   await request(`/parcels/${parcelId}/reject`, {
     method: 'POST',
-    headers: { 'X-Role': 'insurance-approver' },
+    body: '{}',
   });
+}
+
+// ── Rules API ───────────────────────────────────────────
+
+export interface RuleData {
+  _id: string;
+  name: string;
+  version: number;
+  active: boolean;
+  priority: number;
+  type: string;
+  conditions: {
+    all?: Array<{ field: string; operator: string; value: unknown }>;
+    any?: Array<{ field: string; operator: string; value: unknown }>;
+  };
+  action: {
+    route_to?: string;
+    require_approval?: string;
+    block_until_approved?: boolean;
+  };
+  createdAt: string;
+  createdBy: string;
+}
+
+export async function getRules(): Promise<RuleData[]> {
+  const result = await request<{ rules: RuleData[] }>('/rules');
+  return result.rules;
+}
+
+export interface CreateRulePayload {
+  name: string;
+  priority: number;
+  type: 'condition_rule' | 'precondition_rule';
+  conditions: {
+    all?: Array<{ field: string; operator: string; value: unknown }>;
+    any?: Array<{ field: string; operator: string; value: unknown }>;
+  };
+  action: {
+    route_to?: string;
+    require_approval?: string;
+    block_until_approved?: boolean;
+  };
+  createdBy: string;
+}
+
+export async function createRule(rule: CreateRulePayload): Promise<RuleData> {
+  const result = await request<{ rule: RuleData }>('/rules', {
+    method: 'POST',
+    body: JSON.stringify(rule),
+  });
+  return result.rule;
 }

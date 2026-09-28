@@ -145,13 +145,57 @@ describe('RuleRepository', () => {
     ).rejects.toThrow();
   });
 
-  // ── Invalid: priority conflict ──────────────────────
-  it('rejects create when another active rule has the same priority', async () => {
-    await repo.create(validInput({ name: 'First', priority: 42 }));
+  // ── Priority shift: inserting at occupied priority ────
+  it('shifts existing rules down when creating at an occupied priority', async () => {
+    const first = await repo.create(validInput({ name: 'First', priority: 42 }));
 
-    await expect(
-      repo.create(validInput({ name: 'Second', priority: 42 })),
-    ).rejects.toThrow(PriorityConflictError);
+    const second = await repo.create(validInput({ name: 'Second', priority: 42 }));
+
+    // New rule gets the requested priority
+    expect(second.priority).toBe(42);
+
+    // Original rule was shifted down by 1
+    const updatedFirst = await repo.findById(first._id);
+    expect(updatedFirst?.priority).toBe(43);
+  });
+
+  it('shifts multiple rules down in cascade', async () => {
+    await repo.create(validInput({ name: 'A', priority: 1 }));
+    await repo.create(validInput({ name: 'B', priority: 2 }));
+    await repo.create(validInput({ name: 'C', priority: 3 }));
+
+    // Insert at priority 2 — rules at 2 and 3 should shift to 3 and 4
+    const newRule = await repo.create(validInput({ name: 'Inserted', priority: 2 }));
+
+    const active = await repo.findActive();
+    expect(active).toHaveLength(4);
+
+    // Verify order: A(1), Inserted(2), B(3), C(4)
+    expect(active[0]?.name).toBe('A');
+    expect(active[0]?.priority).toBe(1);
+    expect(active[1]?.name).toBe('Inserted');
+    expect(active[1]?.priority).toBe(2);
+    expect(active[2]?.name).toBe('B');
+    expect(active[2]?.priority).toBe(3);
+    expect(active[3]?.name).toBe('C');
+    expect(active[3]?.priority).toBe(4);
+
+    expect(newRule.priority).toBe(2);
+  });
+
+  it('does not shift when priority is unused', async () => {
+    await repo.create(validInput({ name: 'At1', priority: 1 }));
+    await repo.create(validInput({ name: 'At5', priority: 5 }));
+
+    // Insert at priority 3 — no rule there, so no shift needed
+    const newRule = await repo.create(validInput({ name: 'At3', priority: 3 }));
+    expect(newRule.priority).toBe(3);
+
+    const active = await repo.findActive();
+    expect(active).toHaveLength(3);
+    expect(active[0]?.priority).toBe(1);
+    expect(active[1]?.priority).toBe(3);
+    expect(active[2]?.priority).toBe(5);
   });
 
   it('allows same priority after first rule is deactivated', async () => {

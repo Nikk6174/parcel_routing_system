@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: parcel-routing-api
+    runtime: node
+    region: oregon
+    plan: free
+    buildCommand: npm install && npm run -w packages/shared build && npm run -w apps/api build
+    startCommand: node apps/api/dist/index.js
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0
+      - key: MONGO_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false
+      - key: SENTRY_DSN
+        sync: false
+      - key: SENTRY_ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      - key: PORT
+        value: 3001

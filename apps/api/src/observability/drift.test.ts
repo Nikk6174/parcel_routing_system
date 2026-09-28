@@ -18,9 +18,10 @@ describe('detectDrift', () => {
 
     const deptA = alerts.find((a) => a.department === 'dept-A');
     expect(deptA).toBeDefined();
-    expect(deptA!.hourShare).toBeCloseTo(0.9);
-    expect(deptA!.weekShare).toBeCloseTo(0.5);
-    expect(Math.abs(deptA!.zScore)).toBeGreaterThan(2.0);
+    if (!deptA) throw new Error('deptA not found');
+    expect(deptA.hourShare).toBeCloseTo(0.9);
+    expect(deptA.weekShare).toBeCloseTo(0.5);
+    expect(Math.abs(deptA.zScore)).toBeGreaterThan(2.0);
   });
 
   // ── Ignores small samples ────────────────────────────

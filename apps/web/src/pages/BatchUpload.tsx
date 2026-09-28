@@ -2,16 +2,24 @@ import React, { useState, useCallback } from 'react';
 import { uploadBatch, getBatchStatus, type BatchUploadResponse, type BatchStatusResponse } from '../api/client';
 import { ConnectionIndicator } from '../components/ConnectionIndicator';
 import { usePolling } from '../hooks/usePolling';
+import type { ResultsFilter } from '../App';
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
 const TERMINAL_STATUSES = new Set([
-  'ROUTED', 'APPROVED', 'REJECTED', 'FAILED', 'TIMED_OUT', 'UNROUTED',
+  'ROUTED', 'APPROVED', 'REJECTED', 'FAILED', 'TIMED_OUT', 'UNROUTED', 'PENDING_APPROVAL',
 ]);
 
-export function BatchUpload(): React.ReactElement {
+interface BatchUploadProps {
+  onNavigateToResults?: (filter: ResultsFilter) => void;
+}
+
+export function BatchUpload({ onNavigateToResults }: BatchUploadProps): React.ReactElement {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadResult, setUploadResult] = useState<BatchUploadResponse | null>(null);
+  const [manualStatus, setManualStatus] = useState<BatchStatusResponse | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshTime, setRefreshTime] = useState<Date | null>(null);
 
   const fetcher = useCallback(
     () => (uploadResult ? getBatchStatus(uploadResult.batchId) : Promise.reject(new Error('no id'))),
@@ -33,6 +41,23 @@ export function BatchUpload(): React.ReactElement {
     },
   );
 
+  const handleRefresh = async (): Promise<void> => {
+    if (!uploadResult) return;
+    setRefreshing(true);
+    try {
+      const latest = await getBatchStatus(uploadResult.batchId);
+      setManualStatus(latest);
+      setRefreshTime(new Date());
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Refresh failed');
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const currentBatchStatus = manualStatus ?? batchStatus;
+  const displayLastUpdated = refreshTime ?? lastUpdated;
+
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -46,8 +71,10 @@ export function BatchUpload(): React.ReactElement {
      * content) is enforced server-side by @fastify/multipart and the
      * streaming parsers. A malicious user can bypass these checks trivially.
      */
-    if (!file.name.endsWith('.json')) {
-      setError('Only .json files are supported. Use the correct file format.');
+    const isJson = file.name.endsWith('.json');
+    const isXml = file.name.endsWith('.xml');
+    if (!isJson && !isXml) {
+      setError('Only .json and .xml files are supported. Use the correct file format.');
       return;
     }
     if (file.size > MAX_FILE_SIZE) {
@@ -93,15 +120,33 @@ export function BatchUpload(): React.ReactElement {
           </div>
         </div>
 
-        {/* Live-updating aggregate counts */}
-        {batchStatus && <BatchCountsDisplay counts={batchStatus.counts} />}
+        {/* Live-updating aggregate counts — click a box to see those parcels */}
+        {currentBatchStatus && (
+          <BatchCountsDisplay
+            counts={currentBatchStatus.counts}
+            onStatusClick={(status) => onNavigateToResults?.({ status, batchId: uploadResult.batchId })}
+          />
+        )}
 
-        <ConnectionIndicator isStale={isStale} isPolling={isPolling} lastUpdated={lastUpdated} />
+        <ConnectionIndicator isStale={isStale} isPolling={isPolling} lastUpdated={displayLastUpdated} />
 
-        <button className="btn btn--secondary" style={{ marginTop: '1rem' }}
-          onClick={() => { setUploadResult(null); setError(null); }}>
-          Upload Another
-        </button>
+        <div style={{ display: 'flex', gap: '0.75rem', marginTop: '1rem', alignItems: 'center' }}>
+          <button className="btn btn--secondary"
+            onClick={() => { setUploadResult(null); setError(null); setManualStatus(null); setRefreshTime(null); }}>
+            Upload Another
+          </button>
+          <button
+            type="button"
+            className="btn btn--secondary"
+            onClick={() => void handleRefresh()}
+            disabled={refreshing}
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem' }}
+            title="Refresh batch status"
+          >
+            <span style={{ display: 'inline-block', transform: refreshing ? 'rotate(180deg)' : 'none', transition: 'transform 0.3s' }}>↻</span>
+            {refreshing ? 'Refreshing…' : 'Refresh Status'}
+          </button>
+        </div>
       </div>
     );
   }
@@ -111,16 +156,16 @@ export function BatchUpload(): React.ReactElement {
     <div className="card">
       <h2>Batch Upload</h2>
       <p className="text-muted">
-        Upload a JSON file containing an array of parcel objects.
+        Upload a JSON or XML container file containing parcel records.
         Each parcel is validated individually — invalid rows are rejected
         without failing the entire batch.
       </p>
 
       <label className="file-picker">
-        <input type="file" accept=".json" onChange={(e) => void handleFileChange(e)}
+        <input type="file" accept=".json,.xml" onChange={(e) => void handleFileChange(e)}
           disabled={uploading} className="file-picker__input" />
         <span className="file-picker__label">
-          {uploading ? 'Uploading…' : 'Choose a .json file'}
+          {uploading ? 'Uploading…' : 'Choose a .json or .xml file'}
         </span>
       </label>
 
@@ -133,9 +178,10 @@ export function BatchUpload(): React.ReactElement {
 
 interface BatchCountsDisplayProps {
   counts: Record<string, number>;
+  onStatusClick?: (status: string) => void;
 }
 
-function BatchCountsDisplay({ counts }: BatchCountsDisplayProps): React.ReactElement {
+function BatchCountsDisplay({ counts, onStatusClick }: BatchCountsDisplayProps): React.ReactElement {
   const routed = (counts['ROUTED'] ?? 0) + (counts['APPROVED'] ?? 0);
   const held = counts['PENDING_APPROVAL'] ?? 0;
   const failed = (counts['FAILED'] ?? 0) + (counts['REJECTED'] ?? 0);
@@ -143,22 +189,42 @@ function BatchCountsDisplay({ counts }: BatchCountsDisplayProps): React.ReactEle
 
   return (
     <div className="batch-counts" data-testid="batch-counts">
-      <div className="batch-counts__item batch-counts__item--success">
+      <button
+        type="button"
+        className="batch-counts__item batch-counts__item--success batch-counts__item--clickable"
+        onClick={() => onStatusClick?.('ROUTED')}
+        title="View routed parcels"
+      >
         <span className="batch-counts__number">{routed}</span>
         <span className="batch-counts__label">Routed</span>
-      </div>
-      <div className="batch-counts__item batch-counts__item--warning">
+      </button>
+      <button
+        type="button"
+        className="batch-counts__item batch-counts__item--warning batch-counts__item--clickable"
+        onClick={() => onStatusClick?.('PENDING_APPROVAL')}
+        title="View parcels held for approval"
+      >
         <span className="batch-counts__number">{held}</span>
         <span className="batch-counts__label">Held</span>
-      </div>
-      <div className="batch-counts__item batch-counts__item--danger">
+      </button>
+      <button
+        type="button"
+        className="batch-counts__item batch-counts__item--danger batch-counts__item--clickable"
+        onClick={() => onStatusClick?.('FAILED')}
+        title="View failed parcels"
+      >
         <span className="batch-counts__number">{failed}</span>
         <span className="batch-counts__label">Failed</span>
-      </div>
-      <div className="batch-counts__item batch-counts__item--info">
+      </button>
+      <button
+        type="button"
+        className="batch-counts__item batch-counts__item--info batch-counts__item--clickable"
+        onClick={() => onStatusClick?.('RECEIVED')}
+        title="View pending parcels"
+      >
         <span className="batch-counts__number">{pending}</span>
         <span className="batch-counts__label">Pending</span>
-      </div>
+      </button>
     </div>
   );
 }

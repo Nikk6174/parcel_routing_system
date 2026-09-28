@@ -62,6 +62,11 @@ const envSchema = z.object({
 
   /** Max ms since last orchestrator tick before /ready returns 503. */
   READY_STALENESS_MS: z.coerce.number().int().positive().default(60_000),
+
+  // ── CORS ───────────────────────────────────────────────
+
+  /** Allowed CORS origin(s). Defaults to '*' (any). Set to frontend URL in production. */
+  CORS_ORIGIN: z.string().default('*'),
 });
 
 /** Typed configuration object derived from environment variables. */

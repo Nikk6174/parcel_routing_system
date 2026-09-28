@@ -52,11 +52,18 @@ export function usePolling<T>(
   const consecutiveFailures = useRef(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Use refs for fetcher and shouldStop so the poll loop doesn't restart
+  // when the caller creates new closures on each render.
+  const fetcherRef = useRef(fetcher);
+  fetcherRef.current = fetcher;
+  const shouldStopRef = useRef(shouldStop);
+  shouldStopRef.current = shouldStop;
+
   const poll = useCallback(async () => {
     if (stopped.current || !enabled) return;
 
     try {
-      const result = await fetcher();
+      const result = await fetcherRef.current();
       setData(result);
       setError(null);
       setLastUpdated(new Date());
@@ -64,7 +71,7 @@ export function usePolling<T>(
       consecutiveFailures.current = 0;
       currentInterval.current = intervalMs;
 
-      if (shouldStop?.(result)) {
+      if (shouldStopRef.current?.(result)) {
         stopped.current = true;
         setIsPolling(false);
         return;
@@ -89,7 +96,7 @@ export function usePolling<T>(
     if (!stopped.current && enabled) {
       timerRef.current = setTimeout(() => void poll(), currentInterval.current);
     }
-  }, [fetcher, intervalMs, maxIntervalMs, shouldStop, enabled]);
+  }, [intervalMs, maxIntervalMs, enabled]);
 
   useEffect(() => {
     if (!enabled) return;

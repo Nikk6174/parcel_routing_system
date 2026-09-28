@@ -22,7 +22,7 @@ import {
   ConditionEvaluator,
   type RuleEngineResult,
 } from '@parcel-routing/shared';
-import { createTestApp, TEST_JWT_SECRET } from '../app.js';
+import { createTestApp } from '../app.js';
 import { getSecretKey } from '../security/index.js';
 import { ParcelRepository } from '../db/parcel-repository.js';
 import { OutcomeRepository } from '../db/outcome-repository.js';
@@ -183,8 +183,9 @@ describe('E2E: Full user journeys', () => {
 
     const outcome = await outcomeRepo.findByParcelId(parcelId as string);
     expect(outcome).toBeDefined();
-    expect(outcome!.department).toBe('MAIL');
-    expect(outcome!.status).toBe(PARCEL_STATUS.ROUTED);
+    if (!outcome) throw new Error('Expected outcome');
+    expect(outcome.department).toBe('MAIL');
+    expect(outcome.status).toBe(PARCEL_STATUS.ROUTED);
   });
 
   // ── E2E 2: Batch with mixed outcomes ──────────────────
@@ -303,7 +304,8 @@ describe('E2E: Full user journeys', () => {
         ((p as Record<string, unknown>)['recipient'] as Record<string, unknown>)['name'] === 'Valid',
     );
     expect(standardParcel).toBeDefined();
-    expect(standardParcel!['status']).toBe(PARCEL_STATUS.ROUTED);
+    if (!standardParcel) throw new Error('Expected standardParcel');
+    expect(standardParcel['status']).toBe(PARCEL_STATUS.ROUTED);
 
     // The high-value parcel should be PENDING_APPROVAL
     const highValueParcel = allParcels.find(
@@ -311,7 +313,8 @@ describe('E2E: Full user journeys', () => {
         ((p as Record<string, unknown>)['recipient'] as Record<string, unknown>)['name'] === 'HighValue',
     );
     expect(highValueParcel).toBeDefined();
-    expect(highValueParcel!['status']).toBe(PARCEL_STATUS.PENDING_APPROVAL);
+    if (!highValueParcel) throw new Error('Expected highValueParcel');
+    expect(highValueParcel['status']).toBe(PARCEL_STATUS.PENDING_APPROVAL);
 
     // The rejected row never made it to the parcels collection at all
     const invalidParcel = allParcels.find(
@@ -396,7 +399,8 @@ describe('E2E: Full user journeys', () => {
 
     const outcome = await outcomeRepo.findByParcelId(parcelId1);
     expect(outcome).toBeDefined();
-    expect(outcome!.department).toBe('HEAVY-DE');
-    expect(outcome!.status).toBe(PARCEL_STATUS.ROUTED);
+    if (!outcome) throw new Error('Expected outcome');
+    expect(outcome.department).toBe('HEAVY-DE');
+    expect(outcome.status).toBe(PARCEL_STATUS.ROUTED);
   });
 });

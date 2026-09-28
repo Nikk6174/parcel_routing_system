@@ -64,12 +64,15 @@ export class ResultBuffer {
 
     this.clearTimer();
 
-    const items = [...this.buffer];
-    this.buffer = [];
-
+    // Drain loop: keep flushing until the buffer is empty.
+    // This handles the case where 1000 items are added while a flush
+    // is in progress — without this, they'd wait for the next timer tick.
     try {
-      if (this.flushHandler) {
-        await this.flushHandler(items);
+      while (this.buffer.length > 0) {
+        const items = this.buffer.splice(0, this.maxSize);
+        if (this.flushHandler) {
+          await this.flushHandler(items);
+        }
       }
     } finally {
       this.flushing = false;

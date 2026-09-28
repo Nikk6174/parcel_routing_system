@@ -1,11 +1,9 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import { MongoClient, type Db } from 'mongodb';
 import {
   PARCEL_STATUS,
   type ParcelDocument,
-  type Rule,
-  type RuleEngineResult,
 } from '@parcel-routing/shared';
 import { ParcelRepository } from '../db/parcel-repository.js';
 import { OutcomeRepository } from '../db/outcome-repository.js';
@@ -251,8 +249,8 @@ describe('PipelineOrchestrator', () => {
     expect(errorLog?.ctx['parcelId']).toBe(parcel._id);
   });
 
-  // ── UNROUTED parcels are retried ──────────────────────
-  it('retries UNROUTED parcels (does not write outcome yet)', async () => {
+  // ── UNROUTED parcels fail immediately ────────────────
+  it('fails UNROUTED parcels immediately (does not retry)', async () => {
     await insertActiveRule();
 
     const parcel = await insertParcel({
@@ -297,14 +295,14 @@ describe('PipelineOrchestrator', () => {
     await orchestrator.processCycle();
     await orchestrator.flushBuffer();
 
-    // Assert: no outcome written (it's being retried, not finalized)
-    const outcomes = await db.collection('outcomes').find({}).toArray();
-    expect(outcomes).toHaveLength(0);
+    // Assert: outcome written as FAILED (not retried)
+    const outcome = await outcomeRepo.findByParcelId(parcel._id);
+    expect(outcome).not.toBeNull();
+    expect(outcome?.status).toBe(PARCEL_STATUS.FAILED);
 
-    // Assert: parcel re-queued (status RECEIVED, retryCount 1)
+    // Assert: parcel status is FAILED
     const updatedParcel = await parcelRepo.findById(parcel._id);
-    expect(updatedParcel?.status).toBe(PARCEL_STATUS.RECEIVED);
-    expect(updatedParcel?.retryCount).toBe(1);
+    expect(updatedParcel?.status).toBe(PARCEL_STATUS.FAILED);
   });
 
   // ── No parcels available ──────────────────────────────

@@ -1,354 +1,342 @@
-# Parcel Routing System
+# Parcel Routing System — Technical Architecture & Decisions
 
-A monorepo for the Parcel Routing System, built with Fastify, React, and MongoDB.
+This document details the core architectural decisions, engineering trade-offs, extensibility guide, and AI collaboration reflections for the Parcel Routing System.
 
-## Prerequisites
+---
 
-- Node.js ≥ 18.x
-- npm ≥ 9.x
-- MongoDB instance (local or remote)
+## Table of Contents
 
-## Getting Started
+1. [Architecture Decisions](#1-architecture-decisions)
+   - [Domain Model & Type Layering (`Parcel` vs `ParcelDocument`)](#domain-model--type-layering-parcel-vs-parceldocument)
+   - [Field Resolution & Namespace Isolation (`custom.*`)](#field-resolution--namespace-isolation-custom)
+   - [Monorepo & Shared Package Strategy (`packages/shared`)](#monorepo--shared-package-strategy-packagesshared)
+   - [Pipeline Architecture: Why No Dedicated Message Queue?](#pipeline-architecture-why-no-dedicated-message-queue)
+   - [I/O Optimization: Result Buffer & In-Memory Batching](#io-optimization-result-buffer--in-memory-batching)
+   - [Execution Model: In-Process vs Worker Threads (Piscina)](#execution-model-in-process-vs-worker-threads-piscina)
+   - [Caching Strategy: In-Memory vs Distributed (Redis)](#caching-strategy-in-memory-vs-distributed-redis)
+2. [Trade-offs](#2-trade-offs)
+3. [How to Extend the System with New Routing Rules](#3-how-to-extend-the-system-with-new-routing-rules)
+   - [Level 1: Data-Only Rule Creation (Zero Code Changes)](#level-1-data-only-rule-creation-zero-code-changes)
+   - [Level 2: Adding a New Operator](#level-2-adding-a-new-operator)
+   - [Level 3: Adding a New Top-Level System Field](#level-3-adding-a-new-top-level-system-field)
+4. [AI Usage Documentation](#4-ai-usage-documentation)
+   - [Where AI Was Leveraged](#where-ai-was-leveraged)
+   - [Critical Modifications & Engineering Corrections](#critical-modifications--engineering-corrections)
+   - [Understanding of Generated Architecture](#understanding-of-generated-architecture)
+   - [Observed Limitations of AI in Production Systems](#observed-limitations-of-ai-in-production-systems)
 
-### 1. Install dependencies
+---
 
-```bash
-npm install
-```
+## 1. Architecture Decisions
 
-### 2. Configure environment
+### Domain Model & Type Layering (`Parcel` vs `ParcelDocument`)
 
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your MongoDB connection string and other settings. See
-[Configuration System](#configuration-system) for details.
-
-### 3. Run in development mode
-
-```bash
-npm run dev
-```
-
-This starts all three packages concurrently:
-
-| Package | URL | Description |
-|---------|-----|-------------|
-| **API** | http://localhost:3001 | Fastify backend |
-| **Web** | http://localhost:5173 | React + Vite frontend |
-| **Shared** | — | TypeScript watcher for shared types |
-
-### Running individual apps
-
-```bash
-# API only
-npm run dev:api
-
-# Web only
-npm run dev:web
-
-# Shared types watcher
-npm run dev:shared
-```
-
-### Build
-
-```bash
-npm run build
-```
-
-### Test
-
-```bash
-npm test
-```
-
-### Lint
-
-```bash
-npm run lint
-```
-
-### Format
-
-```bash
-# Write formatted output
-npm run format
-
-# Check only (CI)
-npm run format:check
-```
-
-## Project Structure
+The domain model enforces a strict architectural boundary between business logic and database persistence:
 
 ```
-/
-├── apps/
-│   ├── api/                  # Fastify backend
-│   │   └── src/
-│   │       ├── config/
-│   │       │   ├── env.ts        # Zod-validated env config (fail-fast)
-│   │       │   └── env.test.ts   # Config validation tests
-│   │       ├── app.ts            # Fastify app factory
-│   │       └── index.ts          # Server entry point
-│   └── web/                  # React + Vite frontend
-│       ├── index.html
-│       └── src/
-│           ├── App.tsx
-│           ├── App.css
-│           └── main.tsx
-├── packages/
-│   └── shared/               # Shared types & schemas
-│       └── src/
-│           └── index.ts          # ApiResponse envelope, etc.
-├── .env.example              # Environment variable template
-├── .env                      # Local environment (git-ignored)
-├── tsconfig.base.json        # Shared TypeScript strict config
-├── eslint.config.mjs         # ESLint 9 flat config
-├── vitest.config.ts          # Root test runner config
-└── README.md
+┌────────────────────────────────────────────────────────┐
+│                      Parcel                            │
+│  (weight, value, destinationCountry, recipient, custom)│
+│  Used by: Rule Engine (packages/shared)                │
+│  Pure business domain — zero knowledge of DB or HTTP   │
+└───────────────────────────▲────────────────────────────┘
+                            │ extends
+┌───────────────────────────┴────────────────────────────┐
+│                  ParcelDocument                        │
+│  (_id, status, retryCount, claimedBy, createdAt, ...)  │
+│  Used by: API DB Layer (apps/api/src/db/)              │
+│  Database persistence & pipeline lifecycle metadata    │
+└────────────────────────────────────────────────────────┘
 ```
 
-## Configuration System
+#### Why this layering matters:
+- **`ParcelDocument` is everything a `Parcel` is, PLUS extra database/pipeline fields.**
+- **Pure Business Logic**: The rule engine (`packages/shared/src/rule-engine/`) only operates on `Parcel`. It does not know or care about MongoDB `_id`, timestamps, retry counts, or `status`. 
+- **Isolated Testability**: Because the rule engine has zero database dependencies, the entire routing evaluation can be unit tested in-memory in milliseconds without spinning up MongoDB or mocking database clients.
+- **Data Encapsulation**: The database layer (`apps/api/src/db/`) handles the storage lifecycle with `ParcelDocument`, while passing only the domain slice to the evaluator.
 
-### Environment Configuration (env-level)
+---
 
-Environment-level configuration is loaded at startup from environment variables
-(via `.env` file in development). The configuration is validated using Zod schemas
-in [`apps/api/src/config/env.ts`](apps/api/src/config/env.ts). If any required
-variable is missing or any value is invalid, the application **fails fast** with
-a clear, readable error message and does not start.
+### Field Resolution & Namespace Isolation (`custom.*`)
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `PORT` | No | `3001` | API server port |
-| `MONGO_URI` | **Yes** | — | MongoDB connection string |
-| `LOG_LEVEL` | No | `info` | Log level: `debug` · `info` · `warn` · `error` |
-| `RATE_LIMIT_MAX` | No | `100` | Max requests per rate-limit window |
-| `RATE_LIMIT_WINDOW_MS` | No | `60000` | Rate-limit window in milliseconds |
-| `JWT_SECRET` | **Yes** | — | HS256 signing key (≥ 32 chars). See [Security](#security). |
+The rule engine features a dedicated `FieldResolver` (`packages/shared/src/rule-engine/field-resolver.ts`) that enforces strict boundary rules:
 
-### Business-Rule Configuration (routing rules) — Phase 3
+1. **Only Allows Known Fields**:
+   - Rules can **only** evaluate top-level domain fields: `weight`, `value`, `destinationCountry`, and `recipient`.
+   - Rules **cannot** reference internal database or system fields like `_id`, `status`, `claimedBy`, or `retryCount`.
+   - Attempting to target internal fields triggers a compile-time and runtime `FieldResolutionError`.
 
-Routing rules (e.g., "parcels over 50 kg go to Department X") are **not** environment
-configuration. They are business-level configuration that:
+2. **Custom Fields Must Use the `custom.` Prefix**:
+   - If an operator tags a parcel with an arbitrary attribute like `fragile: true`, it is stored in `parcel.custom = { fragile: true }`.
+   - When building a rule, the field identifier must explicitly be `"custom.fragile"`, not `"fragile"`.
+   - **Why this separation matters**: It creates a clear boundary between immutable first-class system fields and dynamic user-defined attributes. Untrusted user attributes cannot shadow or tamper with core billing/routing attributes (e.g., a payload cannot submit `{ custom: { weight: 0.1 } }` to override the real physical weight of 15kg).
 
-- Lives in **MongoDB**, not in environment variables or config files
-- Can be modified at runtime without redeploying the application
-- Is versioned and auditable (who changed what, when)
-- Is loaded and cached by the API at startup and refreshed periodically
+---
 
-**Why are these separated?**
+### Monorepo & Shared Package Strategy (`packages/shared`)
 
-| Concern | Env config | Business-rule config |
-|---------|-----------|---------------------|
-| **What changes** | Ports, connection strings, log levels | Routing rules, thresholds, department mappings |
-| **Who changes it** | Operators / DevOps | Business users / admins |
-| **When it changes** | Per deploy / per environment | At any time, at runtime |
-| **Where it lives** | `.env` / environment variables | MongoDB collection |
-| **Change requires** | Restart (or re-read env) | No restart — hot-reloaded |
+The codebase is organized as an npm workspaces monorepo:
+- `packages/shared`: Shared types, domain contracts, validation schemas, and the rule engine.
+- `apps/api`: Fastify backend, MongoDB repositories, orchestrator pipeline.
+- `apps/web`: React frontend dashboard.
 
-Mixing these concerns would make the system fragile: a routing-rule change should
-never require a redeploy, and an infrastructure change should never risk corrupting
-routing logic.
-
-## Architecture Decisions
-
-<!-- Append new decisions below this line -->
-
-### ADR-001: Monorepo Tooling — npm Workspaces
-
-**Decision:** Use npm workspaces (built into npm) for monorepo management.
-
-**Context:** Evaluated npm workspaces, Turborepo, and Nx. Turborepo adds build
-caching and task orchestration; Nx adds code generation and dependency-graph
-visualization.
-
-**Rationale:** npm workspaces is the simplest option that satisfies current
-requirements (shared dependencies, cross-package references, unified scripts).
-It introduces zero additional tooling dependencies. Turborepo or Nx can be
-adopted later if build performance becomes a bottleneck.
-
-### ADR-002: Configuration System — Zod Validation with Fail-Fast
-
-**Decision:** Validate all environment variables at startup using Zod, failing
-fast with readable errors.
-
-**Rationale:** Silent configuration errors are a common source of production
-incidents. By validating eagerly at startup, we catch misconfigurations during
-deployment rather than at runtime when a code path first accesses an undefined
-variable. The `loadConfig()` function accepts an injectable env record so the
-validation logic itself is fully unit-testable.
-
-### ADR-003: Testing — Vitest
-
-**Decision:** Use Vitest for unit and integration testing across the monorepo.
-
-**Rationale:** Vitest shares Vite's resolver and transform pipeline, ensuring
-test-time module resolution matches dev-time resolution exactly. It supports
-native ESM, has first-class TypeScript support, and is significantly faster
-than Jest for ESM projects. A single root `vitest.config.ts` discovers tests
-across all workspaces.
-
-## Continuous Integration
-
-A GitHub Actions workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
-runs on every PR and push to `main`:
+#### How Backend and Frontend Use the Shared Package:
+They do not consume the same components. `packages/shared` acts as a toolbox where each application takes only what it needs:
 
 ```
-lint → typecheck → tests (unit + integration + e2e) → build
+packages/shared
+├── types/ (ParcelStatus, Document interfaces) ────────┬──> apps/web (Status badges, UI types)
+│                                                      └──> apps/api (DB repos, controllers)
+├── schemas/ (Zod validation schemas) ────────────────────> apps/api (HTTP request validation)
+└── rule-engine/ (RuleEngine, Matcher, Operators) ────────> apps/api (Pipeline evaluation)
 ```
 
-The pipeline fails the PR if any step fails. All tests use `mongodb-memory-server`
-(in-process mongod binary) — no external services or Docker required.
+- **Backend Uses**:
+  - The Rule Engine (`RuleEngine`, `RuleMatcher`, `ConditionEvaluator`) to route parcels.
+  - Document Types (`ParcelDocument`, `RuleDocument`, `OutcomeDocument`) for database interaction.
+  - Zod Schemas (`createParcelSchema`, `createRuleSchema`) for input validation.
+- **Frontend Uses**:
+  - Shared domain constants and status types (e.g., `PARCEL_STATUS = ['RECEIVED', 'CLAIMED', 'ROUTED', 'PENDING_APPROVAL', 'UNROUTED', 'FAILED', 'REJECTED']`).
 
-### Branch protection recommendation
+#### The Core Benefit: Type Consistency & Drift Prevention
+- **Eliminating String Drift**: The backend persists `status: "ROUTED"`. The frontend renders a green badge when `status === "ROUTED"`. With a single shared constant, typos or case discrepancies (like backend writing `"Routed"` while the frontend expects `"ROUTED"`) are caught by the TypeScript compiler.
+- **Zero Duplication**: When an engineer adds a new parcel status or field, updating the shared package forces both the API and Web apps to reconcile their contracts immediately.
+- **Why the Rule Engine Lives in Shared**: Even though the frontend doesn't evaluate rules today, the engine has zero dependencies on Node.js, HTTP, or databases. Placing it in `packages/shared` decouples it completely from Fastify and MongoDB, enabling future client-side rule simulation or edge execution without any refactoring.
 
-Configure the following in **GitHub → Settings → Branches → main → Branch protection**:
+---
 
-- ✅ Require status checks to pass before merging → select the `ci` job
-- ✅ Require branches to be up to date before merging
-- ✅ Do not allow bypassing the above settings
+### Pipeline Architecture: Why No Dedicated Message Queue?
 
-This ensures no code reaches `main` with a red CI.
+Instead of provisioning external message broker infrastructure (RabbitMQ, Apache Kafka, AWS SQS), the system uses an atomic **claim-based pipeline** inside MongoDB.
 
-## Adding a new rule safely — branch to merge
+#### Why a dedicated queue was not chosen:
+- **Single Server Architecture**: The project runs as a single server instance. The primary architectural benefit of an external message queue—distributing messages across dozens of horizontally scaled, decoupled worker nodes—would not be realized on a single instance.
+- **Zero Operational Overhead**: Running RabbitMQ or Kafka requires running, monitoring, clustering, securing, and backing up an entirely separate stateful service.
+- **Atomic Concurrency Guarantee**: MongoDB's native atomic `findOneAndUpdate` with query `{ status: "RECEIVED" }` and update `{ $set: { status: "CLAIMED", claimedBy: workerId, claimedAt: new Date() } }` guarantees that exactly one worker claims a parcel, providing exactly-once semantics without distributed lock managers.
+- **Built-in Crash Recovery**: If a worker or server crashes mid-flight, the orchestrator runs a periodic stale claim recovery check (`recoverStaleClaims()`), resetting claims older than 60 seconds back to `RECEIVED`.
 
-A concrete walkthrough showing how the rule engine, test suite, and CI work together
-to catch regressions.
+---
 
-**Scenario:** Add a rule that routes parcels over 30 kg to a "HEAVY" department.
+### I/O Optimization: Result Buffer & In-Memory Batching
 
-### 1. Create a branch
+Database roundtrips are the primary performance bottleneck in I/O systems. Updating parcel statuses and writing outcome audit records one by one would severely limit throughput.
 
-```bash
-git checkout -b feat/heavy-parcel-rule
-```
-
-### 2. Add a test for the new rule
-
-In `packages/shared/src/rule-engine/rule-engine.test.ts`, add:
-
-```typescript
-it('routes parcels over 30kg to HEAVY department', () => {
-  const rules: Rule[] = [{
-    _id: 'heavy-rule',
-    name: 'Heavy Parcel Route',
-    priority: 1,
-    type: 'condition_rule',
-    conditions: { all: [{ field: 'weight', operator: '>', value: 30 }] },
-    action: { route_to: 'HEAVY' },
-    active: true,
-    version: 1,
-    createdBy: 'test',
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  }];
-
-  const result = engine.evaluate(
-    { weight: 35, value: 100, destinationCountry: 'NL', recipient: testRecipient, custom: {} },
-    rules,
-  );
-
-  expect(result.status).toBe('ROUTED');
-  expect(result.department).toBe('HEAVY');
-});
-```
-
-### 3. Run tests locally
-
-```bash
-npm test
-```
-
-All tests pass including the new one — the rule engine already supports `>` conditions,
-so no code changes are needed. The rule is created at runtime via `POST /rules`.
-
-### 4. Add the rule to production (no code deploy)
-
-```bash
-curl -X POST https://your-api/rules \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Heavy Parcel Route",
-    "priority": 1,
-    "type": "condition_rule",
-    "conditions": { "all": [{ "field": "weight", "operator": ">", "value": 30 }] },
-    "action": { "route_to": "HEAVY" },
-    "createdBy": "ops-admin"
-  }'
-```
-
-The rule is live immediately — no restart needed.
-
-### 5. What happens if someone introduces a regression
-
-Suppose a developer accidentally changes the `>` operator to mean `>=` instead of `>`.
-The boundary test `'routes parcels over 30kg'` (weight: 35) still passes, but the
-existing operator test for `>` with exact boundary values would fail:
+The system uses an in-memory **Result Buffer** (`apps/api/src/pipeline/result-buffer.ts`) to batch MongoDB operations into efficient `bulkWrite` commands.
 
 ```
-FAIL  operators.test.ts > '>' operator > returns false when values are equal
+Individual Parcel Evaluated
+          │
+          ▼
+   [ Result Buffer ]  (accumulates in memory)
+          │
+    Flushes when:
+    ├── 1. Buffer reaches capacity (50 items)  → "Cart is full, checkout now"
+    └── 2. Timer expires (5 seconds)          → "Don't wait forever, flush current items"
+          │
+          ▼
+   MongoDB bulkWrite()  (1 single network trip for 50 records)
 ```
 
-CI blocks the PR from merging. The regression never reaches `main`.
+#### What happens if the server crashes before a flush?
+- **The Risk**: Any routing results sitting in memory that have not yet been flushed to the `outcomes` collection are lost.
+- **The Safety Mechanism**: Because the database write has not executed, the affected parcels remain in the `CLAIMED` status in MongoDB.
+- **Self-Healing**: When the server restarts, the orchestrator's stale claim recovery process detects parcels that have been stuck in `CLAIMED` status for over 60 seconds and resets them to `RECEIVED`.
+- **Result**: No permanent data loss occurs. The parcels are simply picked up on the next tick and re-evaluated.
 
-### 6. Push and merge
+---
 
-```bash
-git push origin feat/heavy-parcel-rule
-# Open PR → CI runs → all green → merge
+### Execution Model: In-Process vs Worker Threads (Piscina)
+
+The project includes `piscina` as a dependency, and the worker module (`apps/api/src/pipeline/worker.ts`) is designed as a pure, stateless compute function. However, the runtime intentionally executes the worker pool **in-process on the main Node.js event loop** rather than spawning physical worker threads.
+
+#### Technical Rationale:
+1. **Rule Evaluation is NOT CPU-Bound**:
+   - Evaluating 4 or 5 condition rules on a parcel takes **less than 0.05 milliseconds** (50 microseconds) of memory operations.
+   - Node.js worker threads are designed for heavy CPU tasks (e.g., image manipulation, cryptography, ML models). Offloading microsecond-level checks to a separate thread is unnecessary.
+2. **Cross-Thread Transfer Overhead**:
+   - Passing data between Node.js worker threads requires `postMessage` with structured cloning (serializing and deserializing objects across V8 memory isolates).
+   - This IPC transfer overhead takes approximately **0.5ms to 1.0ms**—making thread delegation **10x to 20x slower** than evaluating the rule directly on the main event loop.
+3. **Database I/O is the Actual Bottleneck**:
+   - 99% of processing time is spent awaiting MongoDB queries. Node.js handles asynchronous I/O natively with high efficiency via `libuv`.
+4. **Tooling & Development Simplicity**:
+   - Spawning worker threads with TypeScript in development (`tsx`) requires custom loaders or pre-compiling workers to physical JavaScript files on disk. An in-process executor provides instant startup with zero build-step fragility.
+5. **Future Extensibility (Dependency Injection)**:
+   - The orchestrator depends on the abstract `WorkerPool` interface (`{ run(input): Promise<output>, destroy(): Promise<void> }`). If the business later introduces heavy computation (e.g., 3D bin-packing or route graph algorithms), switching to real multi-threaded Piscina workers requires changing only 3 lines of instantiation code.
+
+---
+
+### Caching Strategy: In-Memory vs Distributed (Redis)
+
+Rule lookups are cached **in-memory** within the Node.js process.
+
+#### Why In-Memory?
+- **Single Process Efficiency**: In a single-instance deployment, in-memory lookups have zero network latency (sub-microsecond access vs 1–3ms over Redis network sockets).
+- **Infrequent Changes**: Routing rules are changed infrequently (a few times per day by admins). When a rule is created or updated, the orchestrator immediately invalidates its internal cache on the next tick.
+
+#### When would you introduce Redis?
+- **Multi-Instance Scaling**: If the API is horizontally scaled to multiple instances behind an Application Load Balancer, an admin updating a rule on Instance A would leave Instances B and C with stale local caches.
+- In that scenario, Redis would serve as a centralized cache with Pub/Sub invalidation events notifying all instances when rule revisions occur. For a single server, adding Redis introduces operational baggage without practical benefit.
+
+---
+
+## 2. Trade-offs
+
+| Decision | Chosen Approach | Alternative Considered | Primary Benefit | Trade-off / Cost |
+| :--- | :--- | :--- | :--- | :--- |
+| **Pipeline Ingestion** | MongoDB Atomic Claims (`findOneAndUpdate`) | Message Broker (RabbitMQ, SQS, Kafka) | Zero extra infrastructure; transactional consistency within one database. | Throughput is bounded by MongoDB write capacity; cannot easily partition work across separate worker clusters. |
+| **Result Persistence** | In-Memory Batched Buffer (`bulkWrite`) | Immediate Synchronous Writes | Drastically reduces DB roundtrips and connection pool pressure. | Unflushed memory results can be lost during an ungraceful crash (mitigated by stale claim recovery). |
+| **Rule Execution** | In-Process Event Loop Evaluation | Worker Threads (`piscina` thread pool) | Zero serialization overhead; 10x faster execution; seamless TypeScript dev experience. | A malicious or poorly written rule with infinite loops would block the event loop. |
+| **Rule Caching** | Local In-Memory Cache | Distributed Cache (Redis) | Sub-microsecond read latency; zero network overhead or external services. | Cannot coordinate cache invalidation across multiple horizontal server nodes without shared pub/sub. |
+| **Priority Handling** | Cascade Auto-Shift on Collision | Strict Rejection (HTTP 409 Conflict) | Frictionless operator UX; allows inserting rules directly into desired precedence slots. | Implicitly modifies priorities of existing rules below the insertion point; requires administrative awareness. |
+| **Client Synchronization** | HTTP Polling (2-second interval) | WebSockets / Server-Sent Events (SSE) | Stateless, firewall/proxy friendly; automatic reconnection with zero heartbeat management. | Up to 2 seconds of latency before UI reflects backend state changes; continuous HTTP traffic. |
+| **Batch File Parsing** | Streaming SAXes (XML) & JSON Stream | Full DOM / In-Memory Array Parsers | Constant memory footprint regardless of file size; structurally immune to XML External Entity (XXE) attacks. | Parser code requires complex state machine handling; harder to write and maintain than `JSON.parse`. |
+
+---
+
+## 3. How to Extend the System with New Routing Rules
+
+The routing engine supports three distinct extension pathways depending on the nature of the business requirement:
+
+```mermaid
+flowchart TD
+    Req([New Business Requirement]) --> Check1{Existing fields & operators suffice?}
+    Check1 -->|Yes| L1[Level 1: Data-Only Rule\nAdmin UI or REST API\nZero Code Changes]
+    Check1 -->|No| Check2{Requires new comparison logic?}
+    Check2 -->|Yes| L2[Level 2: New Operator\nAdd to operators.ts\nRegister in OPERATORS map]
+    Check2 -->|No| L3[Level 3: New System Field\nAdd to Parcel interface\nUpdate field-resolver whitelist]
 ```
 
-## Known Limitations & Scaling Path
+---
 
-### Current architecture: MongoDB-as-queue
+### Level 1: Data-Only Rule Creation (Zero Code Changes)
 
-The orchestrator uses MongoDB's `findOneAndUpdate` as an atomic claim mechanism.
-Parcels are inserted with `status: RECEIVED`, claimed by workers via an atomic
-status transition to `CLAIMED`, and updated to their final status after processing.
+If the new rule uses existing top-level fields (`weight`, `value`, `destinationCountry`, `recipient`) or any user-defined attribute (`custom.*`) along with existing operators (`eq`, `neq`, `>`, `>=`, `<`, `<=`, `in`, `not_in`), **no code changes or deployments are needed**.
 
-**Why this was chosen:**
+#### Example: Routing Fragile Items
+1. Warehouse operators tag incoming parcels with `custom.fragile: "true"`.
+2. Admin logs into the Web Dashboard $\rightarrow$ **Rules Management** $\rightarrow$ **+ New Rule**.
+3. Configure the rule:
+   - **Name**: `Fragile Goods Special Handling`
+   - **Priority**: `1` (Automatically shifts existing rules down by 1 position)
+   - **Condition**: Field: `custom.fragile` | Operator: `eq` | Value: `"true"`
+   - **Action**: Route to `Fragile Department`
+4. On the next tick, the orchestrator invalidates its cache and immediately applies the new rule.
 
-- **Single dependency:** MongoDB serves as both the persistent store and the work
-  queue, avoiding the operational overhead of a separate broker (RabbitMQ, SQS, etc.).
-- **Simplicity:** No message serialization, no dead-letter configuration, no
-  broker-specific client libraries. The claim mechanism is a single `findOneAndUpdate`.
-- **Transactional safety:** The parcel document and its status live in the same store,
-  so there's no two-phase commit between "acknowledge message" and "update database."
+---
 
-### Assumed initial scale
+### Level 2: Adding a New Operator
 
-This design is appropriate for:
+When business logic requires a new type of comparison (e.g., regex matching, substring containment, prefix checking).
 
-- **Throughput:** ~1,000 parcels/minute sustained (single API instance, single orchestrator).
-- **Concurrency:** 1–4 worker threads per process (piscina pool).
-- **Data volume:** Up to ~10M parcels in the collection before index performance degrades.
+1. **Implement the Comparator** in `packages/shared/src/rule-engine/operators.ts`:
+   ```typescript
+   export function startsWithOperator(actual: unknown, expected: unknown): boolean {
+     if (typeof actual !== 'string' || typeof expected !== 'string') return false;
+     return actual.startsWith(expected);
+   }
+   ```
+2. **Register in the Operator Map**:
+   ```typescript
+   export const OPERATORS: Record<string, OperatorFunction> = {
+     // ... existing operators
+     starts_with: startsWithOperator,
+   };
+   ```
+3. **Add Unit Tests** in `packages/shared/test/operators.test.ts`.
+4. The operator is now instantly available in rule definitions across both backend and UI.
 
-### The bottleneck: Mongo write/claim contention
+---
 
-Beyond ~5,000 parcels/minute, the bottleneck will be **write lock contention on
-`findOneAndUpdate`**. Each claim attempt takes a write lock on the matched document.
-With many concurrent claimers, MongoDB spends increasing time on lock acquisition
-rather than actual work.
+### Level 3: Adding a New Top-Level System Field
 
-Symptoms that indicate you've hit this limit:
+When an attribute is deemed a permanent first-class entity across all parcels (e.g., `originWarehouse`).
 
-- `claimNext()` latency increases beyond 50ms p99
-- `oldest_received_age_seconds` gauge climbs steadily
-- MongoDB WiredTiger write tickets saturate
+1. **Update Domain Interface** in `packages/shared/src/rule-engine/types.ts`:
+   ```typescript
+   export interface Parcel {
+     weight: number;
+     value: number;
+     destinationCountry: string;
+     recipient: Recipient;
+     originWarehouse?: string; // New top-level field
+     custom?: Record<string, unknown>;
+   }
+   ```
+2. **Whitelist in Field Resolver** in `packages/shared/src/rule-engine/field-resolver.ts`:
+   ```typescript
+   const KNOWN_TOP_LEVEL_FIELDS = new Set([
+     'weight',
+     'value',
+     'destinationCountry',
+     'recipient',
+     'originWarehouse', // Allows rule conditions to reference this field directly
+   ]);
+   ```
+3. **Update Schemas & UI Form**:
+   - Update Zod validation in `packages/shared/src/schemas/parcel.ts`.
+   - Add input field in `apps/web/src/pages/ParcelForm.tsx`.
 
-### Scaling path
+---
 
-| Scale | Solution |
-|-------|----------|
-| **2–5× current** | **Mongo sharding** on `status + createdAt` — distributes claim load across shards. Cheapest first step. |
-| **10–50× current** | **Message broker** (RabbitMQ or AWS SQS) replaces the MongoDB claim mechanism. Parcels are still stored in MongoDB, but the claim/dispatch path moves to the broker. The orchestrator becomes a consumer. |
-| **100×+ current** | **Event streaming** (Kafka) for ingestion, with MongoDB as the read-optimized store. Worker pools scale horizontally as consumer groups. |
+## 4. AI Usage Documentation
 
-**Migration path (OpenTelemetry):** The current Sentry-only observability stack can
-be extended by adding an OpenTelemetry exporter to Sentry's SDK. This lets you send
-the same traces and metrics to Prometheus/Grafana/Jaeger without changing
-instrumentation code — you just add export targets.
+AI tools (Anthropic Claude and Google Gemini) were utilized as pair-programming assistants throughout the development of the system. In accordance with professional engineering standards, all generated code and architectural patterns were critically reviewed, vetted, and modified.
+
+To take a look at the prompts used throughout development, go to the [Prompts folder](./Prompts).
+
+---
+
+### Where AI Was Leveraged
+
+1. **Boilerplate & Parser Scaffolding**:
+   - Generating the initial streaming SAXes XML parser state machine (`xml-stream-parser.ts`).
+   - Drafting Sentry OpenTelemetry and custom metric integration wrappers (`sentry.ts`, `metrics.ts`).
+2. **Test Matrix Synthesis**:
+   - Formulating edge-case test matrices for the rule engine (e.g., handling null prototypes, mixed numeric type comparisons, deep object traversal).
+   - Drafting concurrent race-condition tests (e.g., 10 simultaneous workers attempting to claim a single parcel).
+3. **Statistical Modeling**:
+   - Deriving the two-sample proportion Z-score algorithm for the automated routing drift detector (`drift.ts`).
+
+---
+
+### Critical Modifications & Engineering Corrections
+
+Several initial AI recommendations were rejected or significantly restructured based on human engineering judgment:
+
+1. **Field Resolution & Namespace Security**:
+   - *AI Proposal*: The AI generated a dynamic dot-path evaluator using generic `lodash.get`-style resolution over the entire parcel object.
+   - *Engineering Correction*: This was rejected due to a critical security vulnerability: it allowed incoming parcel payloads with malicious custom metadata (e.g., `{ custom: { weight: 0.5 } }` or `{ custom: { _id: "admin" } }`) to shadow or access internal system attributes.
+   - *Implementation*: Replaced with strict namespace isolation: top-level fields are strictly whitelisted, and dynamic user fields are enforced under `custom.*`.
+
+2. **Priority Conflict Strategy**:
+   - *AI Proposal*: The AI originally implemented a strict uniqueness validation on rule priorities, throwing an HTTP 409 Conflict if an admin attempted to create a rule with an existing priority number.
+   - *Engineering Correction*: This caused severe administrative friction. Reordering rules required deleting and recreating multiple rules manually.
+   - *Implementation*: Replaced with an atomic descending priority cascade auto-shift (`rule-repository.ts`), allowing seamless insertion of rules at any position.
+
+3. **XML Parser Selection & XXE Vulnerability**:
+   - *AI Proposal*: The AI initially suggested using `fast-xml-parser` with default DOM parsing options.
+   - *Engineering Correction*: DOM parsing creates memory spikes on multi-megabyte batch uploads and introduces XML External Entity (XXE) risks.
+   - *Implementation*: Switched to the streaming `saxes` parser, which does not expand external entities or DTDs by default, structurally eliminating XXE attacks and keeping memory usage constant.
+
+4. **Premature Multi-Threading (Piscina)**:
+   - *AI Proposal*: The AI attempted to wire all parcel evaluations through a Piscina worker thread pool immediately at server startup.
+   - *Engineering Correction*: Benchmarks showed that serializing tiny parcel objects across thread boundaries took ~1ms, whereas in-memory evaluation took <0.05ms. Threading was making the system slower while adding TypeScript build complexity.
+   - *Implementation*: Retained the decoupled `WorkerPool` interface for architectural extensibility, but implemented the runtime as an inline in-process pool.
+
+---
+
+### Understanding of Generated Architecture
+
+Full ownership and comprehension of the codebase is maintained across all components:
+
+- **Atomic State Transitions**: Understanding why `{ status: "RECEIVED" }` inside MongoDB's `findOneAndUpdate` acts as a CAS (Compare-And-Swap) lock, preventing distributed duplicate processing without Redis Redlock.
+- **Drift Detection Math**: Understanding why the Z-score calculation requires a minimum sample threshold ($n \ge 30$) to prevent false-positive alerts on low-volume routing shifts.
+- **Reverse Priority Updates**: Understanding why priority cascade shifting must iterate in descending order (`order: -1`) when updating MongoDB documents under a unique compound index (`{ priority: 1, active: true }`) to avoid transient unique constraint collisions.
+
+---
+
+### Observed Limitations of AI in Production Systems
+
+1. **Over-Engineering Bias**: AI models consistently propose enterprise distributed systems (Kafka, Redis, RabbitMQ, Microservices) for scenarios where single-process patterns with reliable database primitives are significantly more robust, cost-effective, and maintainable.
+2. **Security & Namespace Blind Spots**: AI models focus primarily on making functional happy-paths work (e.g., resolving nested fields) while missing secondary boundary threats like field shadowing, prototype pollution, and XXE injection.
+3. **UX & Workflow Disconnect**: AI favors strict mathematical correctness (rejecting priority overlaps with 409 errors) over pragmatic operational ergonomics (auto-shifting priorities to facilitate user intent).

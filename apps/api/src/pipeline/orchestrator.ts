@@ -19,8 +19,6 @@ import type {
 } from './types.js';
 import {
   countParcelProcessed,
-  recordProcessingDuration,
-  emitTickGauges,
   captureParcelError,
   cronCheckIn,
 } from '../observability/index.js';
@@ -44,18 +42,35 @@ function engineStatusToParcelStatus(
   return map[engineStatus];
 }
 
+// ── In-flight claim entry ───────────────────────────────
+
+interface InFlightEntry {
+  parcel: ParcelDocument;
+  claimedAt: number; // Date.now() timestamp
+}
+
 // ── Orchestrator ────────────────────────────────────────
 
 /**
  * Main processing pipeline orchestrator.
  *
  * Runs on the main thread. Responsibilities:
- * 1. Batch-claim parcels from MongoDB
- * 2. Dispatch to worker pool for rule evaluation
- * 3. Buffer results in memory
- * 4. Flush outcomes to MongoDB (count OR time trigger)
- * 5. Handle retries and permanent failures
- * 6. Run stale claim recovery on a separate interval
+ * 1. Fetch RECEIVED parcels from MongoDB in bulk (single query)
+ * 2. Track claims in-memory (no per-parcel DB write for claiming)
+ * 3. Dispatch to worker pool for rule evaluation
+ * 4. Buffer results in memory
+ * 5. Flush outcomes to MongoDB via bulkWrite (batch DB writes)
+ * 6. Handle retries and permanent failures
+ * 7. Run in-memory stale claim recovery on a separate interval
+ *
+ * DB WRITE REDUCTION:
+ * Previously, claiming N parcels required N individual findOneAndUpdate calls.
+ * Now the entire cycle uses:
+ *   - 1 find() to fetch RECEIVED parcels
+ *   - 1 bulkWrite to mark them as CLAIMED in DB
+ *   - 1 bulkWrite to write outcomes
+ *   - 1 bulkWrite to update final parcel statuses
+ * This reduces Atlas pressure from ~500 writes/cycle to ~4 writes/cycle.
  */
 export class PipelineOrchestrator {
   private running = false;
@@ -66,6 +81,14 @@ export class PipelineOrchestrator {
   private readonly buffer: ResultBuffer;
   private cronSlug: string;
   private lastCheckInId: string | undefined;
+  private lastCronCheckInTime = 0;
+
+  /**
+   * In-memory claim tracker. Maps parcelId → InFlightEntry.
+   * Parcels are added when fetched from DB, removed when their outcome
+   * is flushed. The stale sweep checks this map for stuck entries.
+   */
+  private readonly inFlight = new Map<string, InFlightEntry>();
 
   constructor(
     private readonly parcelRepo: ParcelRepository,
@@ -106,6 +129,17 @@ export class PipelineOrchestrator {
       maxRetries: this.config.maxRetries,
     });
 
+    // On startup, recover any CLAIMED parcels left by a previous server
+    // instance (crash, hot-reload, restart). Since we use in-memory claiming,
+    // any CLAIMED parcel in the DB with no corresponding inFlight entry
+    // is orphaned. Reset ALL of them back to RECEIVED with staleAfterMs=0.
+    const recovered = await this.parcelRepo.recoverStaleClaims(0);
+    if (recovered > 0) {
+      this.logger.info('Recovered orphaned CLAIMED parcels from previous instance', {
+        count: recovered,
+      });
+    }
+
     // Stale claim recovery runs on its own separate interval,
     // independent of the main processing loop.
     this.sweepTimer = setInterval(() => {
@@ -138,6 +172,16 @@ export class PipelineOrchestrator {
     await this.buffer.flush();
     this.buffer.dispose();
 
+    // Re-queue any in-flight parcels back to RECEIVED so they aren't lost
+    if (this.inFlight.size > 0) {
+      const staleIds = Array.from(this.inFlight.keys());
+      await this.parcelRepo.bulkRequeue(staleIds);
+      this.logger.info('Re-queued in-flight parcels on shutdown', {
+        count: staleIds.length,
+      });
+      this.inFlight.clear();
+    }
+
     await this.pool.destroy();
     this.logger.info('Pipeline stopped');
   }
@@ -159,6 +203,7 @@ export class PipelineOrchestrator {
 
     this.logger.info('Claimed parcels for processing', {
       count: claimed.length,
+      inFlightTotal: this.inFlight.size,
     });
 
     // Dispatch all claimed parcels to the worker pool concurrently.
@@ -215,45 +260,77 @@ export class PipelineOrchestrator {
 
   private async runClaimLoop(): Promise<void> {
     while (this.running) {
-      // Cron check-in: mark "in progress" at start of tick
-      this.lastCheckInId = cronCheckIn(this.cronSlug, 'in_progress') ?? this.lastCheckInId;
+      const now = Date.now();
+      const shouldCronCheckIn = now - this.lastCronCheckInTime >= 60_000;
+
+      if (shouldCronCheckIn) {
+        this.lastCronCheckInTime = now;
+        this.lastCheckInId = cronCheckIn(this.cronSlug, 'in_progress') ?? this.lastCheckInId;
+      }
 
       try {
         await this.processCycle();
 
-        // Record heartbeat for /ready staleness check
+        // Record heartbeat for /ready staleness check (every tick)
         recordOrchestratorTick();
 
-        // Cron check-in: mark "ok" after successful tick
-        cronCheckIn(this.cronSlug, 'ok', this.lastCheckInId);
+        // Cron check-in: mark "ok" after successful tick if this tick was checked in
+        if (shouldCronCheckIn && this.lastCheckInId) {
+          cronCheckIn(this.cronSlug, 'ok', this.lastCheckInId);
+        }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         this.logger.error('Claim cycle failed', { error: message });
 
         // Cron check-in: mark "error" on tick failure
-        cronCheckIn(this.cronSlug, 'error', this.lastCheckInId);
+        if (this.lastCheckInId) {
+          cronCheckIn(this.cronSlug, 'error', this.lastCheckInId);
+        }
       }
       await this.sleep(this.config.claimIntervalMs);
     }
   }
 
   /**
-   * Batch-claim up to batchSize parcels by calling claimNext concurrently.
-   * Each claimNext is an atomic findOneAndUpdate — concurrent calls are safe.
+   * In-memory batch claim strategy:
+   * 1. Fetch up to batchSize RECEIVED parcels in a single find() query
+   * 2. Mark them CLAIMED in DB via a single bulkWrite (not N individual calls)
+   * 3. Track them in the in-memory inFlight map
+   *
+   * If the bulkWrite for CLAIMED fails, the parcels stay RECEIVED in DB
+   * and will be picked up on the next cycle — no data loss.
    */
   private async batchClaim(): Promise<ParcelDocument[]> {
-    const promises = Array.from({ length: this.config.batchSize }, () =>
-      this.parcelRepo.claimNext('pipeline-worker'),
-    );
-    const results = await Promise.allSettled(promises);
+    // Only fetch as many as we have room for (avoid unbounded in-flight growth)
+    const capacity = Math.max(0, this.config.batchSize - this.inFlight.size);
+    if (capacity === 0) return [];
 
-    const claimed: ParcelDocument[] = [];
-    for (const result of results) {
-      if (result.status === 'fulfilled' && result.value !== null) {
-        claimed.push(result.value);
-      }
+    const parcels = await this.parcelRepo.fetchReceived(capacity);
+    if (parcels.length === 0) return [];
+
+    // Filter out any parcels that are already in-flight (race condition guard)
+    const fresh = parcels.filter((p) => !this.inFlight.has(p._id));
+    if (fresh.length === 0) return [];
+
+    // Mark as CLAIMED in DB in one bulkWrite — single DB round-trip
+    try {
+      await this.parcelRepo.bulkUpdateStatus(
+        fresh.map((p) => ({ parcelId: p._id, status: PARCEL_STATUS.CLAIMED as ParcelStatus })),
+      );
+    } catch (err: unknown) {
+      // If bulk claim fails, skip this cycle — parcels stay RECEIVED, no harm
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.error('Bulk claim write failed — skipping cycle', { error: message });
+      return [];
     }
-    return claimed;
+
+    // Track in memory
+    const now = Date.now();
+    for (const p of fresh) {
+      this.inFlight.set(p._id, { parcel: p, claimedAt: now });
+    }
+
+    return fresh;
   }
 
   // ── Private: rule cache ───────────────────────────────
@@ -291,8 +368,9 @@ export class PipelineOrchestrator {
    * Process a batch of flushed results:
    * 1. Build OutcomeDocuments for successful evaluations
    * 2. Write outcomes via bulkWrite (ordered:false)
-   * 3. Update parcel statuses for successful writes
-   * 4. Retry UNROUTED, errored, and write-failed parcels
+   * 3. Update parcel statuses in a single bulkWrite
+   * 4. Remove from inFlight map
+   * 5. Retry UNROUTED, errored, and write-failed parcels
    */
   private async handleFlush(items: PipelineResult[]): Promise<void> {
     const toWrite: Array<{
@@ -300,14 +378,16 @@ export class PipelineOrchestrator {
       parcel: ParcelDocument;
     }> = [];
     const toRetry: Array<{ parcel: ParcelDocument; reason: string }> = [];
+    const toFail: Array<{ parcel: ParcelDocument; reason: string; retryCount?: number }> = [];
 
     for (const item of items) {
       if (item.output.error !== null) {
-        // Engine threw or worker crashed — retry
+        // Engine threw or worker crashed — retry (transient error)
         toRetry.push({ parcel: item.parcel, reason: item.output.error });
       } else if (item.output.result?.status === 'UNROUTED') {
-        // No rule matched — retry (rules might be updated between attempts)
-        toRetry.push({
+        // No rule matched — fail immediately (retrying won't help,
+        // no human is adding a rule in the next second)
+        toFail.push({
           parcel: item.parcel,
           reason: item.output.result.reason,
         });
@@ -326,24 +406,33 @@ export class PipelineOrchestrator {
       const writeResult =
         await this.outcomeRepo.bulkWriteOutcomes(outcomes);
 
-      // Update parcel statuses for successfully written outcomes
+      // Collect status updates for successfully written outcomes
+      const statusUpdates: Array<{ parcelId: string; status: ParcelStatus }> = [];
       for (const outcomeId of writeResult.succeeded) {
         const tw = toWrite.find((t) => t.outcome._id === outcomeId);
         if (tw) {
-          await this.parcelRepo.updateStatus(
-            tw.parcel._id,
-            tw.outcome.status,
-          );
+          statusUpdates.push({
+            parcelId: tw.parcel._id,
+            status: tw.outcome.status,
+          });
 
           // Emit metric for each successfully processed parcel
           countParcelProcessed(
             tw.outcome.status,
             tw.outcome.department,
           );
+
+          // Remove from in-flight tracker
+          this.inFlight.delete(tw.parcel._id);
         }
       }
 
-      // Handle write failures — retry those parcels
+      // Single bulkWrite for all status updates instead of N individual updateOne calls
+      if (statusUpdates.length > 0) {
+        await this.parcelRepo.bulkUpdateStatus(statusUpdates);
+      }
+
+      // Handle write failures — retry those parcels (transient DB error)
       for (const failure of writeResult.failed) {
         const tw = toWrite.find((t) => t.outcome._id === failure.id);
         if (tw) {
@@ -360,61 +449,74 @@ export class PipelineOrchestrator {
       });
     }
 
-    // Process retries
+    // Process retries (only actual errors — worker crashes, DB write failures)
+    const requeueIds: string[] = [];
+
     for (const retry of toRetry) {
-      await this.handleRetry(retry.parcel, retry.reason);
+      const newRetryCount = retry.parcel.retryCount + 1;
+      if (newRetryCount < this.config.maxRetries) {
+        requeueIds.push(retry.parcel._id);
+        this.logger.warn('Retrying parcel', {
+          parcelId: retry.parcel._id,
+          correlationId: retry.parcel.correlationId,
+          retryCount: newRetryCount,
+          reason: retry.reason,
+        });
+      } else {
+        // Exceeded max retries — move to permanent failure
+        toFail.push({ ...retry, retryCount: newRetryCount });
+      }
+      // Remove from in-flight either way
+      this.inFlight.delete(retry.parcel._id);
     }
-  }
 
-  // ── Private: retry logic ──────────────────────────────
+    // Bulk re-queue retriable parcels
+    if (requeueIds.length > 0) {
+      await this.parcelRepo.bulkRequeue(requeueIds);
+    }
 
-  /**
-   * Retry a failed/unrouted parcel:
-   * - retryCount < maxRetries → re-queue as RECEIVED (try again)
-   * - retryCount >= maxRetries → mark as FAILED permanently + write FAILED outcome
-   */
-  private async handleRetry(
-    parcel: ParcelDocument,
-    reason: string,
-  ): Promise<void> {
-    const newRetryCount = parcel.retryCount + 1;
-
-    if (newRetryCount < this.config.maxRetries) {
-      await this.parcelRepo.requeue(parcel._id);
-
-      this.logger.warn('Retrying parcel', {
-        parcelId: parcel._id,
-        correlationId: parcel.correlationId,
-        retryCount: newRetryCount,
-        reason,
-      });
-    } else {
-      // Max retries exceeded — permanently fail
-      await this.parcelRepo.markFailed(parcel._id);
-
-      // Write a FAILED outcome for audit trail
-      const failedOutcome = this.buildFailedOutcome(parcel, reason);
-      await this.outcomeRepo.bulkWriteOutcomes([failedOutcome]);
-
-      // Emit metric for FAILED parcel
-      countParcelProcessed('FAILED', null);
-
-      // Capture in Sentry — every FAILED transition is an error event
-      captureParcelError(
-        new Error(`Parcel permanently failed: ${reason}`),
-        {
-          correlationId: parcel.correlationId,
-          parcelId: parcel._id,
-          batchId: parcel.batchId,
-        },
+    // ── Batched permanent failures ──────────────────────
+    if (toFail.length > 0) {
+      // Build all failed outcomes at once
+      const failedOutcomes = toFail.map((f) =>
+        this.buildFailedOutcome(f.parcel, f.reason),
       );
 
-      this.logger.error('Parcel permanently failed after max retries', {
-        parcelId: parcel._id,
-        correlationId: parcel.correlationId,
-        retryCount: newRetryCount,
-        maxRetries: this.config.maxRetries,
-        reason,
+      // 1 bulkWrite for all failed outcomes (audit trail)
+      await this.outcomeRepo.bulkWriteOutcomes(failedOutcomes);
+
+      // 1 bulkWrite to mark all parcels as FAILED
+      await this.parcelRepo.bulkUpdateStatus(
+        toFail.map((f) => ({
+          parcelId: f.parcel._id,
+          status: PARCEL_STATUS.FAILED as ParcelStatus,
+          retryCount: f.retryCount,
+        })),
+      );
+
+      // Emit metrics and Sentry for each
+      for (const fail of toFail) {
+        countParcelProcessed('FAILED', null);
+        this.inFlight.delete(fail.parcel._id);
+
+        this.logger.error('Parcel permanently failed after max retries', {
+          parcelId: fail.parcel._id,
+          correlationId: fail.parcel.correlationId,
+          reason: fail.reason,
+        });
+
+        captureParcelError(
+          new Error(`Parcel permanently failed: ${fail.reason}`),
+          {
+            correlationId: fail.parcel.correlationId,
+            parcelId: fail.parcel._id,
+            batchId: fail.parcel.batchId,
+          },
+        );
+      }
+
+      this.logger.error('Parcels permanently failed', {
+        count: toFail.length,
       });
     }
   }
@@ -476,17 +578,38 @@ export class PipelineOrchestrator {
   // ── Private: stale sweep ──────────────────────────────
 
   /**
-   * Stale claim recovery — runs on its own separate interval,
-   * independent of the main processing loop.
+   * In-memory stale claim recovery.
+   *
+   * Checks the inFlight map for parcels claimed longer than staleAfterMs.
+   * Re-queues them in DB via a single bulkRequeue call.
+   *
+   * This replaces the old DB-level recoverStaleClaims — since we now track
+   * claims in memory, the sweep source is the in-memory map, not a DB query.
    */
   private async sweepStaleClaims(): Promise<void> {
     try {
-      const recovered = await this.parcelRepo.recoverStaleClaims(
-        this.config.staleAfterMs,
-      );
-      if (recovered > 0) {
-        this.logger.info('Recovered stale claims', { count: recovered });
+      const now = Date.now();
+      const staleIds: string[] = [];
+
+      for (const [id, entry] of this.inFlight) {
+        if (now - entry.claimedAt > this.config.staleAfterMs) {
+          staleIds.push(id);
+        }
       }
+
+      if (staleIds.length === 0) return;
+
+      // Re-queue in DB in one call
+      const recovered = await this.parcelRepo.bulkRequeue(staleIds);
+
+      // Remove from in-flight
+      for (const id of staleIds) {
+        this.inFlight.delete(id);
+      }
+
+      this.logger.info('Recovered stale in-flight claims', {
+        count: recovered,
+      });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       this.logger.error('Stale claim recovery failed', { error: message });

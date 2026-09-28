@@ -1,8 +1,9 @@
 import Fastify, { type FastifyInstance } from 'fastify';
+import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
-import { type Db, type MongoClient } from 'mongodb';
+import { type Db } from 'mongodb';
 import type { EnvConfig } from './config/env.js';
 import { initJwtSecret } from './security/index.js';
 
@@ -36,9 +37,7 @@ import { approvalRoutes } from './routes/approval-routes.js';
  * Accepts EITHER a full EnvConfig (production startup) OR a plain Db
  * handle (for testing without a full config).
  */
-export function createApp(config: EnvConfig): FastifyInstance;
-export function createApp(config: EnvConfig, db: Db): FastifyInstance;
-export function createApp(config: EnvConfig, db?: Db): FastifyInstance {
+export async function createApp(config: EnvConfig, db?: Db): Promise<FastifyInstance> {
   // Initialize JWT verification key from config.
   initJwtSecret(config.JWT_SECRET);
 
@@ -57,8 +56,20 @@ export function createApp(config: EnvConfig, db?: Db): FastifyInstance {
    * behind the proxy. The Strict-Transport-Security header (HSTS) set by
    * helmet tells browsers to always use HTTPS for future requests.
    */
-  void app.register(helmet, {
+  await app.register(helmet, {
     contentSecurityPolicy: false, // CSP managed by the frontend, not API
+  });
+
+  /**
+   * CORS — allow cross-origin requests from the frontend.
+   * In development (default): allows all origins.
+   * In production: set CORS_ORIGIN to the Vercel frontend URL.
+   */
+  await app.register(cors, {
+    origin: config.CORS_ORIGIN === '*' ? true : config.CORS_ORIGIN,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'x-correlation-id'],
+    credentials: true,
   });
 
   /**
@@ -75,7 +86,7 @@ export function createApp(config: EnvConfig, db?: Db): FastifyInstance {
    *   import RedisStore from '@fastify/rate-limit/store/redis';
    *   store: new RedisStore({ client: redisClient })
    */
-  void app.register(rateLimit, {
+  await app.register(rateLimit, {
     max: config.RATE_LIMIT_MAX,
     timeWindow: config.RATE_LIMIT_WINDOW_MS,
     addHeadersOnExceeding: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true, 'x-ratelimit-reset': true },
@@ -111,7 +122,7 @@ export function createApp(config: EnvConfig, db?: Db): FastifyInstance {
 
     // Check 1: MongoDB ping
     try {
-      const dbHandle = app.mongo?.db ?? db;
+      const dbHandle = (app as unknown as { mongo?: { db?: Db } }).mongo?.db ?? db;
       if (dbHandle) {
         await dbHandle.command({ ping: 1 });
       } else {
@@ -144,10 +155,9 @@ export function createApp(config: EnvConfig, db?: Db): FastifyInstance {
     return { status: 'ok' as const };
   });
 
-  // If a DB handle was provided (e.g. in tests), register routes immediately.
-  // In production, the DB connection is established in index.ts before starting.
+  // If a DB handle was provided, register routes before returning.
   if (db) {
-    void registerRoutes(app, db);
+    await registerRoutes(app, db);
   }
 
   return app;
@@ -176,6 +186,7 @@ export async function createTestApp(db: Db): Promise<FastifyInstance> {
     DRIFT_Z_THRESHOLD: 2.0,
     DRIFT_MIN_SAMPLE: 30,
     READY_STALENESS_MS: 60_000,
+    CORS_ORIGIN: '*',
   };
 
   const app = Fastify({ logger: { level: 'error' } });
