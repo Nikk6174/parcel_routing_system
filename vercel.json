@@ -2,5 +2,11 @@
   "buildCommand": "npm run -w packages/shared build && npm run -w apps/web build",
   "outputDirectory": "apps/web/dist",
   "installCommand": "npm install",
-  "framework": "vite"
+  "framework": "vite",
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
 }
