@@ -41,13 +41,17 @@ export class RuleRepository {
   /**
    * Create a new routing rule (version 1, active).
    *
+   * If an active rule already occupies the requested priority, all active
+   * rules at that priority and below (higher numbers) are shifted down by 1
+   * so the new rule can slot in. Rules above (lower numbers) are untouched.
+   *
    * @throws ZodError if the input is invalid.
-   * @throws PriorityConflictError if an active rule with the same priority exists.
    */
   async create(input: CreateRuleInput): Promise<RuleDocument> {
     const parsed = createRuleSchema.parse(input);
 
-    await this.assertUniquePriority(parsed.priority);
+    // Shift existing rules down if the requested priority is already taken
+    await this.shiftPrioritiesDown(parsed.priority);
 
     const doc: RuleDocument = {
       _id: new ObjectId().toHexString(),
@@ -64,6 +68,38 @@ export class RuleRepository {
 
     await this.collection.insertOne(doc);
     return doc;
+  }
+
+  /**
+   * Shift active rules at `startPriority` and below (higher numbers) down
+   * by 1 to make room for a new rule.
+   *
+   * Updates are performed one-by-one from the HIGHEST priority number
+   * downward so the unique partial index on { priority, active: true }
+   * is never violated mid-shift.
+   *
+   * If no active rule occupies `startPriority`, this is a no-op.
+   */
+  private async shiftPrioritiesDown(startPriority: number): Promise<void> {
+    // Find all active rules at or below the requested priority (sorted descending)
+    const toShift = await this.collection
+      .find({ active: true, priority: { $gte: startPriority } })
+      .sort({ priority: -1 })
+      .toArray();
+
+    if (toShift.length === 0) return;
+
+    // Only shift if the exact startPriority is occupied
+    const isOccupied = toShift.some((r) => r.priority === startPriority);
+    if (!isOccupied) return;
+
+    // Update one-by-one from highest to lowest to avoid unique index collision
+    for (const rule of toShift) {
+      await this.collection.updateOne(
+        { _id: rule._id },
+        { $set: { priority: rule.priority + 1 } },
+      );
+    }
   }
 
   /**
