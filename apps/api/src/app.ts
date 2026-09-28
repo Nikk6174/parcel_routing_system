@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify';
+import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
@@ -57,6 +58,18 @@ export async function createApp(config: EnvConfig, db?: Db): Promise<FastifyInst
    */
   await app.register(helmet, {
     contentSecurityPolicy: false, // CSP managed by the frontend, not API
+  });
+
+  /**
+   * CORS — allow cross-origin requests from the frontend.
+   * In development (default): allows all origins.
+   * In production: set CORS_ORIGIN to the Vercel frontend URL.
+   */
+  await app.register(cors, {
+    origin: config.CORS_ORIGIN === '*' ? true : config.CORS_ORIGIN,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'x-correlation-id'],
+    credentials: true,
   });
 
   /**
@@ -173,6 +186,7 @@ export async function createTestApp(db: Db): Promise<FastifyInstance> {
     DRIFT_Z_THRESHOLD: 2.0,
     DRIFT_MIN_SAMPLE: 30,
     READY_STALENESS_MS: 60_000,
+    CORS_ORIGIN: '*',
   };
 
   const app = Fastify({ logger: { level: 'error' } });

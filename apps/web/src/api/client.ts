@@ -5,7 +5,7 @@
  * error handling logic live in exactly one place.
  */
 
-const API_BASE = '/api';
+const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
 interface ApiResponse<T> {
   status: 'ok' | 'error';
