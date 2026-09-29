@@ -1,6 +1,8 @@
 # Parcel Routing System — Technical Architecture & Decisions
 
-Video Description: https://youtu.be/kr6wCBOxuyU
+Video Description : https://drive.google.com/file/d/1ra0wDG0xFx-2ulWfF2zcuZVN21yHOgRc/view?usp=drivesdk
+
+
 
 This document details the core architectural decisions, engineering trade-offs, extensibility guide, and AI collaboration reflections for the Parcel Routing System.
 
